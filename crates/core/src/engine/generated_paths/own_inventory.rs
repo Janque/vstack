@@ -27,7 +27,7 @@ use crate::engine::{PlanOptions, plan_apply};
 use crate::env::Env;
 use crate::model::Scope;
 
-use super::INVENTORY;
+use super::{GeneratedPaths, INVENTORY};
 
 /// The first word of every line this check writes.
 const NAME: &str = "render-inventory";
@@ -134,14 +134,30 @@ fn refusal(finding: &Finding) -> String {
     text
 }
 
-/// The committed inventory against the set a pass renders.
+/// The committed inventory against the set the declaration renders at.
 ///
-/// Both directions are findings. A rendered path the inventory does not list
-/// reads as hand-written to every reader of it, and a path it lists that
-/// nothing renders excludes a hand-written file from their scans.
-fn judge(listed: &BTreeSet<String>, rendered: &BTreeSet<String>) -> Standing {
-    let missing: Vec<String> = rendered.difference(listed).cloned().collect();
-    let stale: Vec<String> = listed.difference(rendered).cloned().collect();
+/// Both directions are findings. A declared path the inventory does not
+/// list reads as hand-written to every reader of it, and a path it lists
+/// that nothing renders excludes a hand-written file from their scans.
+///
+/// `declared` is every position this pass writes and every one it held —
+/// a position the declaration renders at whose bytes the pass would not
+/// claim — in one set, so a held position is judged exactly as a written
+/// one. A checkout without its lock holds every render whose bytes differ
+/// from its source, and it holds the tree whole: a skill whose source
+/// gained a file with no render lands every position of that tree here,
+/// the unrendered one among them. Judged off the written set alone, the
+/// held ones would each be named stale beside the one path the inventory
+/// lacks; judged as neither, the unrendered one would pass unnamed, which
+/// is the direction a gate may not fail in. The one reading this costs is
+/// a checkout with its lock and a genuine conflict at a position a newly
+/// declared item renders at: `refresh` never lists that position, so this
+/// names it missing until the conflict is settled, which `refresh` itself
+/// refuses on the same run. Red on a tree whose renders cannot be trusted
+/// is the right answer there; green on an unrendered file is not.
+fn judge(listed: &BTreeSet<String>, declared: &BTreeSet<String>) -> Standing {
+    let missing: Vec<String> = declared.difference(listed).cloned().collect();
+    let stale: Vec<String> = listed.difference(declared).cloned().collect();
     if missing.is_empty() && stale.is_empty() {
         return Standing::Current;
     }
@@ -177,34 +193,51 @@ fn committed(inventory: &Path) -> Result<BTreeSet<String>, Finding> {
 /// The inventory is a parameter rather than a path derived inside, so the
 /// control below drives this whole path — the read, the planned set and the
 /// comparison — against a planted inventory instead of exercising `judge`
-/// alone, which would stay green if this stopped reading either side.
-fn check_against(root: &Path, inventory: &Path) -> Standing {
+/// alone, which would stay green if this stopped reading either side. The
+/// environment is one for the same reason: the lockless control plans a
+/// fixture of its own through this path.
+fn check_against(env: &Env, root: &Path, inventory: &Path) -> Standing {
     let unplanned = |cause: String| {
         Standing::Refused(Finding::Unplanned {
             root: crate::paths::slashed(root),
             cause,
         })
     };
-    let env = match Env::detect() {
-        Ok(env) => env,
-        Err(error) => return unplanned(error.to_string()),
-    };
     let scope = Scope::Project {
         root: root.to_path_buf(),
     };
-    let report = match plan_apply(&env, &scope, &PlanOptions::default()) {
+    let report = match plan_apply(env, &scope, &PlanOptions::default()) {
         Ok(report) => report,
         Err(error) => return unplanned(error.to_string()),
     };
     match committed(inventory) {
-        Ok(listed) => judge(&listed, &report.generated.relative(root)),
+        Ok(listed) => judge(
+            &listed,
+            &GeneratedPaths::spelled(
+                report
+                    .generated
+                    .inventory(root)
+                    .iter()
+                    .chain(&report.generated.held),
+                root,
+            ),
+        ),
         Err(finding) => Standing::Refused(finding),
     }
 }
 
 /// A checkout held to the inventory committed in it.
 fn check(root: &Path) -> Standing {
-    check_against(root, &root.join(INVENTORY))
+    let env = match Env::detect() {
+        Ok(env) => env,
+        Err(error) => {
+            return Standing::Refused(Finding::Unplanned {
+                root: crate::paths::slashed(root),
+                cause: error.to_string(),
+            });
+        }
+    };
+    check_against(&env, root, &root.join(INVENTORY))
 }
 
 /// The check itself: this repository's `.kendex-generated.json` is the set
@@ -255,7 +288,8 @@ fn an_inventory_that_is_not_the_render_set_is_refused() {
     )
     .expect("the planted inventory is writable");
 
-    let standing = check_against(&root, &path);
+    let env = Env::detect().expect("the host environment is readable");
+    let standing = check_against(&env, &root, &path);
     assert_eq!(
         standing,
         Standing::Refused(Finding::Drifted {
@@ -270,4 +304,178 @@ fn an_inventory_that_is_not_the_render_set_is_refused() {
     let mut lines = text.lines();
     assert_eq!(lines.next(), Some("render-inventory: missing=1"));
     assert_eq!(lines.next(), Some("render-inventory: stale=1"));
+}
+
+/// A project with one skill rendered from its local source and its
+/// inventory written, on which each control makes the changes the
+/// inventory has not seen.
+struct Unrendered {
+    _tmp: tempfile::TempDir,
+    env: Env,
+    root: std::path::PathBuf,
+}
+
+/// Where the lockless control's one missing render goes.
+const UNRENDERED: &str = ".claude/skills/two/SKILL.md";
+
+#[allow(
+    clippy::expect_used,
+    reason = "every expect here is a fixture precondition, not the behaviour under test"
+)]
+impl Unrendered {
+    fn new() -> Unrendered {
+        let tmp = tempfile::tempdir().expect("a scratch directory");
+        let home = crate::test_util::rooted(&tmp);
+        let env = Env::fake(&home, crate::env::FakeOs::Linux);
+        std::fs::create_dir_all(home.join(".claude")).expect("the tool's home directory");
+        let root = home.join("app");
+        // A project the inventory write covers: `plan` writes it for a
+        // repository root only.
+        std::fs::create_dir_all(root.join(".git")).expect("the fixture repository");
+        std::fs::create_dir_all(root.join(".claude")).expect("the tool's project directory");
+        std::fs::write(
+            root.join("kendex.toml"),
+            "schema = 6\n\n[install]\nharnesses = [\"claude\"]\nmethod = \"copy\"\n",
+        )
+        .expect("the manifest is writable");
+        let fixture = Unrendered {
+            _tmp: tmp,
+            env,
+            root,
+        };
+        fixture.write_skill("one", "Body.\n");
+        crate::apply::execute(&fixture.env, &fixture.add("one").plan)
+            .expect("the first skill renders");
+        fixture
+    }
+
+    /// The rendered skill's source edited, so its render differs from its
+    /// source: what a lockless checkout holds and a locked one lists. Then
+    /// a second skill declared and rendered nowhere, missing either way.
+    /// The one-file skill keeps the missing set to the path the
+    /// declaration adds.
+    fn with_a_second_skill_unrendered(self) -> Unrendered {
+        self.write_skill("one", "Edited body.\n");
+        self.write_skill("two", "Body.\n");
+        self.declare("two");
+        self
+    }
+
+    /// The rendered skill's source gains a file with no render. The tree
+    /// as a whole now differs from its source, so a lockless checkout
+    /// holds every position in it, the unrendered one included.
+    fn with_a_file_added_to_the_skill(self) -> Unrendered {
+        let dir = crate::source::local_source_root(&self.env, &self.scope()).join("skills/one");
+        std::fs::write(dir.join("notes.md"), "Notes.\n").expect("the added file is writable");
+        self
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::Project {
+            root: self.root.clone(),
+        }
+    }
+
+    fn write_skill(&self, name: &str, body: &str) {
+        let dir = crate::source::local_source_root(&self.env, &self.scope())
+            .join("skills")
+            .join(name);
+        std::fs::create_dir_all(&dir).expect("the skill's source directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\n---\n{body}"),
+        )
+        .expect("the skill's source is writable");
+    }
+
+    /// Declare `name` from the local source in the manifest alone, the
+    /// way a commit that forgot its render leaves the tree.
+    fn declare(&self, name: &str) {
+        let path = crate::manifest::manifest_path(&self.env, &self.scope());
+        let mut manifest = crate::manifest::load_for_mutation(&path)
+            .expect("the manifest reads")
+            .expect("the first add wrote the manifest");
+        manifest.declared_mut(crate::model::ItemKind::Skill).insert(
+            name.to_owned(),
+            crate::manifest::ItemDecl::from_source(crate::manifest::LOCAL_SOURCE_NAME),
+        );
+        crate::manifest::save(&path, &manifest).expect("the manifest is writable");
+    }
+
+    /// The plan that declares and renders `name` from the local source.
+    fn add(&self, name: &str) -> crate::engine::EngineReport {
+        crate::engine::ops::add(
+            &self.env,
+            &self.scope(),
+            &crate::engine::ops::AddRequest {
+                source: Some(crate::manifest::LOCAL_SOURCE_NAME.to_owned()),
+                skills: vec![name.to_owned()],
+                ..crate::engine::ops::AddRequest::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("declaring {name}: {error}"))
+    }
+
+    fn lock(&self) -> std::path::PathBuf {
+        crate::lock::lock_path(&self.env, &self.scope())
+    }
+
+    /// The finding, and the keyed lines it opens with.
+    fn checked(&self) -> (Standing, Vec<String>) {
+        let standing = check_against(&self.env, &self.root, &self.root.join(INVENTORY));
+        let lines = match &standing {
+            Standing::Current => Vec::new(),
+            Standing::Refused(finding) => refusal(finding)
+                .lines()
+                .take_while(|line| line.starts_with(NAME))
+                .map(str::to_owned)
+                .collect(),
+        };
+        (standing, lines)
+    }
+}
+
+/// The finding a fixture is owed, with its lock or without: the one path
+/// nothing renders, and no render named stale because its bytes moved.
+fn one_missing(path: &str) -> (Standing, Vec<String>) {
+    (
+        Standing::Refused(Finding::Drifted {
+            missing: vec![path.to_owned()],
+            stale: Vec::new(),
+        }),
+        vec!["render-inventory: missing=1".to_owned()],
+    )
+}
+
+/// The finding with the lock, then the same finding with it taken away.
+#[allow(
+    clippy::expect_used,
+    reason = "taking the lock away is a fixture step, not the behaviour under test"
+)]
+fn with_and_without_the_lock(fixture: &Unrendered, expected: (Standing, Vec<String>)) {
+    assert_eq!(fixture.checked(), expected, "with the lock");
+    std::fs::remove_file(fixture.lock()).expect("the lock is there to take away");
+    assert_eq!(fixture.checked(), expected, "without the lock");
+}
+
+/// The lockless control: with nothing saying the bytes on disk are kendex's
+/// own, the edited skill's render is held rather than listed as rendered,
+/// and the check still names the one path the inventory lacks and nothing
+/// else. The inverse plans the same tree with its lock, where the edited
+/// render is stale rather than held, and pins the same line.
+#[test]
+fn a_lockless_checkout_names_the_missing_render_alone() {
+    let fixture = Unrendered::new().with_a_second_skill_unrendered();
+    with_and_without_the_lock(&fixture, one_missing(UNRENDERED));
+}
+
+/// The held tree's own unrendered position: a lockless checkout holds the
+/// whole skill once one file in it is unrendered, and the check names that
+/// file missing rather than passing a tree it could not judge. The inverse
+/// plans the same tree with its lock, where the skill is stale and the
+/// file is missing by the written set alone, and pins the same line.
+#[test]
+fn a_lockless_checkout_names_an_unrendered_file_of_a_held_skill() {
+    let fixture = Unrendered::new().with_a_file_added_to_the_skill();
+    with_and_without_the_lock(&fixture, one_missing(".claude/skills/one/notes.md"));
 }
