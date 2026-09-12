@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { ObservedItem, Tag } from "@/bindings";
+import type { ObservedItem, ProvenanceRow, Tag } from "@/bindings";
 import { KINDS } from "@/lib/labels";
-import type { PackageOf } from "@/lib/package-identity";
+import { type PackageOf, recordedSummaryIndex } from "@/lib/package-identity";
 import { observed } from "@/test/observed";
 import {
   filterItems,
   groupFor,
   groupItems,
+  groupMatches,
   groupPlaces,
   groupRef,
   groupScopes,
@@ -585,6 +586,71 @@ describe("withRecordedMissing", () => {
     );
     const rows = withRecordedMissing(groups, [missingRow({})]);
     expect(rows).toEqual(groups);
+  });
+
+  /** The row a record seeds for an installation the scan did not see: no
+   *  position, and the author's words off the declaration. */
+  const seeded = (summary: string | null): ProvenanceRow => ({
+    scope: { scope: "global" },
+    kind: "skill",
+    name: "deploy",
+    harness: "claude",
+    at: null,
+    origin: { origin: "marketplace", source: "kendex", repo: "kendex" },
+    summary,
+    package: { kind: "skill", name: "deploy" },
+  });
+
+  /** A row for a copy the scan did see, in another place: its words can be
+   *  the file a tool loads rather than the declaration, so they are not the
+   *  record's and must not stand in for them. */
+  const observedElsewhere = (summary: string): ProvenanceRow => ({
+    ...seeded(summary),
+    scope: { scope: "project", root: "/acme" },
+    at: "/acme/.claude/skills/deploy",
+  });
+
+  // The record carries the author's words whether or not a copy is left, so
+  // the row reads and is searched by the same text an installed row shows —
+  // and reads them off the seeded row even where another place's copy is
+  // described by the file a tool loads.
+  it("reads a missing row's description off the record", () => {
+    const rows = withRecordedMissing(
+      [],
+      [missingRow({})],
+      recordedSummaryIndex([
+        observedElsewhere("Whatever the file says"),
+        seeded("Ship the release"),
+      ]),
+    );
+    expect(rows[0].summary).toBe("Ship the release");
+    expect(groupMatches(rows[0], "ship the release")).toBe(true);
+    // A declaration that says nothing leaves the row blank. The words on an
+    // observed row can be the file a tool loads, and
+    // `crates/core/src/library.rs::declared_header` forbids filling that
+    // blank from it.
+    const blank = withRecordedMissing(
+      [],
+      [missingRow({})],
+      recordedSummaryIndex([
+        observedElsewhere("Whatever the file says"),
+        seeded(null),
+      ]),
+    );
+    expect(blank[0].summary).toBeNull();
+  });
+
+  // The inverse: a row the scan made already carries its package's words,
+  // and nothing here may restate them.
+  it("leaves an observed row's description as the scan's own", () => {
+    const groups = groupItems([item({})], recorded, () => "From the copy");
+    const rows = withRecordedMissing(
+      groups,
+      [missingRow({})],
+      recordedSummaryIndex([seeded("Ship the release")]),
+    );
+    expect(rows).toEqual(groups);
+    expect(rows[0].summary).toBe("From the copy");
   });
 
   // Two places missing one package is one package.

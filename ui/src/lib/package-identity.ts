@@ -9,7 +9,7 @@ import type {
   Scope,
 } from "@/bindings";
 import { PLACE_COUNTING_LABEL, PLACE_UNCHECKED_LABEL } from "@/lib/copy";
-import { observedAt, type PackageIdentity } from "@/lib/derive";
+import { observedAt, type PackageIdentity, packageKey } from "@/lib/derive";
 import type { ReadState } from "@/lib/read-state";
 import { scopeKey } from "@/lib/scope";
 import { useProvenanceStore } from "@/stores/provenance";
@@ -88,6 +88,56 @@ export function summaryIndex(rows: ProvenanceRow[]): SummaryOf {
     null;
 }
 
+/** What the author says one recorded package does, or null where the
+ *  record carries nothing reachable about it. */
+export type RecordedSummaryOf = (ref: PackageRef) => string | null;
+
+/** The words every surface shows about a package the records account for,
+ *  keyed by the package rather than by an installation.
+ *
+ *  A package whose every rendering was deleted has no installation left to
+ *  ask about, and {@link summaryIndex} can only answer about one: the row
+ *  the record seeded for it carries the author text and no position, so
+ *  this is how a row with no copy left reads the same words an installed
+ *  row of that package reads.
+ *
+ *  A row the record seeded — the one with no position — speaks for the
+ *  package, and an observed row only where the record seeded none. Its
+ *  silence speaks too: an author who wrote no words leaves a blank row, and
+ *  `library.rs::declared_header` states that nothing downstream may fill
+ *  that blank from the file a tool reads — which is what an observed row
+ *  falls back to, and for a generated wrapper is kendex's own line. So a
+ *  seeded row with no words is an answer of none, not an absence to go
+ *  looking past.
+ *
+ *  Among observed rows the first with words speaks. Two places can hold
+ *  two versions of the package, and the row these words are shown on is one
+ *  package — so it says one thing about itself rather than picking a place
+ *  it does not name. */
+export function recordedSummaryIndex(rows: ProvenanceRow[]): RecordedSummaryOf {
+  // Held apart from the words, because a row with none still answers for
+  // its package: tracked on the summary alone, a seeded blank would read as
+  // no seeded row at all and let an observed one stand in for it.
+  const seededPackages = new Set<string>();
+  const byPackage = new Map<string, { seeded: boolean; summary: string }>();
+  for (const row of rows) {
+    if (!row.package) continue;
+    const key = packageKey(row.package);
+    const seeded = row.at === null;
+    if (seeded) seededPackages.add(key);
+    if (!row.summary) continue;
+    const held = byPackage.get(key);
+    if (held && (held.seeded || !seeded)) continue;
+    byPackage.set(key, { seeded, summary: row.summary });
+  }
+  return (ref) => {
+    const key = packageKey(ref);
+    const held = byPackage.get(key);
+    if (!held || (!held.seeded && seededPackages.has(key))) return null;
+    return held.summary;
+  };
+}
+
 /** Where one observed installation came from, or null where the join has
  *  no record of it.
  *
@@ -128,6 +178,14 @@ export function useOriginIndex(): OriginOf | null {
 export function useSummaryIndex(): SummaryOf {
   const rows = useProvenanceStore((s) => s.rows);
   return useMemo(() => summaryIndex(rows), [rows]);
+}
+
+/** The same words for a package the records account for, for the rows no
+ *  observation is left of. Stale for the same reason, and never null for
+ *  it. */
+export function useRecordedSummaryIndex(): RecordedSummaryOf {
+  const rows = useProvenanceStore((s) => s.rows);
+  return useMemo(() => recordedSummaryIndex(rows), [rows]);
 }
 
 /** The same index for a component, rebuilt only when the join changes:
