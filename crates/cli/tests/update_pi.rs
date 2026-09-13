@@ -301,16 +301,9 @@ fn a_pinned_pi_extension_installs_and_verifies_against_its_revision() {
     fs::create_dir_all(project.join(".pi")).unwrap();
     let refresh = kendex(&root, &project, &["refresh", "--scope", "project", "--yes"]);
     assert!(
-        !refresh.status.success(),
+        refresh.status.success(),
         "{}",
         String::from_utf8_lossy(&refresh.stderr)
-    );
-
-    let update = kendex(&root, &project, &["update-pi"]);
-    assert!(
-        update.status.success(),
-        "{}",
-        String::from_utf8_lossy(&update.stderr)
     );
     assert_eq!(
         fs::read_to_string(project.join(".pi/packages/pi-widgets/index.js")).unwrap(),
@@ -397,6 +390,26 @@ fn verification_and_record_recovery_compare_pi_bytes() {
         .status
         .success()
     );
+    let refresh = kendex(
+        tmp.path(),
+        &project,
+        &["refresh", "--scope", "project", "--yes"],
+    );
+    assert!(!refresh.status.success(), "{refresh:?}");
+    assert_eq!(
+        fs::read_to_string(&installed).unwrap(),
+        "export const version = 9;\n"
+    );
+    // The refresh wrote the scope's record for what it planned; the edited
+    // package is not in it, and the recovery below starts lockless again.
+    let lock = kendex_core::lock::load(&project.join(".kendex-lock.json")).unwrap();
+    assert!(
+        !lock
+            .entries
+            .values()
+            .any(|entry| entry.name == "pi-widgets")
+    );
+    fs::remove_file(project.join(".kendex-lock.json")).unwrap();
     fs::remove_dir_all(project.join(".pi/packages/pi-widgets")).unwrap();
     assert!(
         !kendex(
@@ -575,6 +588,31 @@ fn a_package_installed_at_the_other_scope_blocks_the_install() {
     assert!(!project.join(".pi/packages/pi-widgets").exists());
 }
 
+/// The other direction: the project the command runs in holds the package
+/// and is registered nowhere, the way a fresh clone is, and the global
+/// scope declares it. Pi loads that project's packages beside the global
+/// ones all the same.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_package_in_the_unregistered_current_project_blocks_the_global_install() {
+    let tmp = fixture();
+    let project = tmp.path().join("dev/app");
+    let env = kendex_core::env::Env::host_rooted(tmp.path());
+    write(
+        &env.global_manifest_file(),
+        &format!(
+            "schema = 6\n\n[sources.cat]\n{}\n\n[pi-extensions.pi-widgets]\nsource = \"cat\"\n",
+            test_util::source_path(&project.join("catalog"))
+        ),
+    );
+
+    let output = kendex(tmp.path(), &project, &["update-pi", "--scope", "global"]);
+    assert!(output.status.success(), "{output:?}");
+    let plan = String::from_utf8_lossy(&output.stdout);
+    assert!(plan.contains("register twice"), "{plan}");
+    assert!(!tmp.path().join(".pi/agent/packages/pi-widgets").exists());
+}
+
 #[test]
 #[allow(clippy::unwrap_used)]
 fn a_legacy_named_package_at_the_other_scope_blocks_the_scoped_name() {
@@ -601,6 +639,33 @@ fn a_legacy_named_package_at_the_other_scope_blocks_the_scoped_name() {
     let plan = String::from_utf8_lossy(&output.stdout);
     assert!(plan.contains("blocked"), "{plan}");
     assert!(plan.contains("pi-hooks is installed at"), "{plan}");
+    assert!(!project.join(".pi/packages/@vanillagreen").exists());
+}
+
+/// The scope's own root still holds the copy an older kendex installed
+/// under the package's earlier name, and no record says so: a settle of
+/// the scoped name would register the package twice in one root.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_legacy_named_copy_in_the_same_root_blocks_the_scoped_settle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = rooted(&tmp);
+    let project = root.join("dev/app");
+    write(
+        &project.join("kendex.toml"),
+        "schema = 6\n\n[sources.cat]\npath = \"catalog\"\n\n[pi-extensions.\"@vanillagreen/pi-hooks\"]\nsource = \"cat\"\n",
+    );
+    write(
+        &project.join("catalog/pi-extensions/pi-hooks/package.json"),
+        "{\"name\": \"@vanillagreen/pi-hooks\", \"version\": \"1.0.0\"}\n",
+    );
+    write(
+        &project.join(".pi/packages/pi-hooks/package.json"),
+        "{\"name\": \"pi-hooks\", \"version\": \"0.9.0\"}\n",
+    );
+
+    let output = kendex(&root, &project, &["refresh", "--scope", "project", "--yes"]);
+    assert!(!output.status.success(), "{output:?}");
     assert!(!project.join(".pi/packages/@vanillagreen").exists());
 }
 
