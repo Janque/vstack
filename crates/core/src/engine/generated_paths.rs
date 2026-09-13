@@ -22,15 +22,6 @@ pub const INVENTORY: &str = ".kendex-generated.json";
 /// The file that travels with a commit that adds or takes away a render:
 /// the inventory recording which paths kendex owns here.
 ///
-/// Not because a render needs it to stand. The engine never reads it back —
-/// it writes it for CI — and a later apply judges the tree by the manifest
-/// and the lock. It travels because the commit offer itself reads the
-/// committed copy: `crate::commit_offer` asks `HEAD`'s inventory whether a
-/// path that is deleted and gone from the render set was one kendex wrote,
-/// which is how a sweep's removal is told from the person's own deletion. A
-/// commit that adds or takes away a render without it leaves that read
-/// answering about a tree the commit no longer holds.
-///
 /// The manifest is deliberately not here. kendex writes keys in it and folds
 /// them into the document the person wrote — `crate::manifest::fold` keeps
 /// their comments, key order and every value it did not touch — so kendex
@@ -63,12 +54,6 @@ pub struct GeneratedPaths {
     pub shared: BTreeSet<PathBuf>,
     /// The positions of items this pass refused to write — a `Conflict` or
     /// `Unmanaged` row — as the other two groups would have carried them.
-    /// Kendex writes nothing for these, so neither the inventory nor the
-    /// offer lists them; they are here for a reader holding the committed
-    /// inventory to what the declaration renders at, which judges these
-    /// positions as it judges the written ones and says why in its own
-    /// module. A lockless checkout, where nothing says the bytes on disk
-    /// are kendex's own, refuses every render that differs from its source.
     pub held: BTreeSet<PathBuf>,
 }
 
@@ -78,12 +63,12 @@ impl GeneratedPaths {
         self.whole.is_empty() && self.shared.is_empty()
     }
 
-    /// Every path the inventory records: both groups, plus the inventory
-    /// file itself. CI reads this to know every path kendex touches.
+    /// The inventory's paths, including its own file.
     pub fn inventory(&self, root: &Path) -> BTreeSet<PathBuf> {
         self.whole
             .iter()
             .chain(&self.shared)
+            .chain(&self.held)
             .cloned()
             .chain(std::iter::once(root.join(INVENTORY)))
             .collect()
@@ -101,8 +86,6 @@ impl GeneratedPaths {
         Self::spelled(self.inventory(root).iter(), root)
     }
 
-    /// Paths as the document spells them, so a reader of the inventory can
-    /// hold the written and held groups against it in one spelling.
     fn spelled<'a>(paths: impl Iterator<Item = &'a PathBuf>, root: &Path) -> BTreeSet<String> {
         paths
             .filter_map(|path| path.strip_prefix(root).ok().map(crate::paths::slashed))
@@ -124,10 +107,6 @@ impl GeneratedPaths {
         Self::laid_out(&self.relative(root), root)
     }
 
-    /// `paths` serialized the way the write lays a document down. The one
-    /// spelling of that layout: [`GeneratedPaths::document`] writes it and
-    /// `own_inventory.rs` holds the committed copy to it over the declared
-    /// set, which in a lockless checkout is wider than the written one.
     fn laid_out(paths: &BTreeSet<String>, root: &Path) -> Result<String> {
         let mut text = serde_json::to_string_pretty(paths).map_err(|error| {
             crate::error::CoreError::JsonParse {
@@ -139,11 +118,6 @@ impl GeneratedPaths {
         Ok(text)
     }
 
-    /// The files kendex owns whole, the inventory file among them — what
-    /// the commit offer covers. The inventory is kendex's own file end to
-    /// end, so a commit may take it; [`companions`] says why one that adds
-    /// or takes away a render does.
-    ///
     /// Owning the FORMAT is not owning the bytes, so the project's manifest
     /// is not here: `crate::manifest::fold` exists because kendex edits the
     /// keys it holds and leaves the rest of that document alone. This set is
@@ -181,10 +155,6 @@ fn positions(artifact: &Artifact) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// The paths this pass renders, by group.
 ///
 /// In-place sources are out: they are executable source, not renders.
-/// Items whose drift row is `Conflict` or `Unmanaged` go to `held`: kendex
-/// writes nothing for them, so neither the inventory nor the offer may
-/// claim them, and the one reader that needs to know they exist reads
-/// that group alone.
 fn collect(
     state: &DesiredState,
     shims: &[ShimStanding],
@@ -237,12 +207,29 @@ pub(super) fn plan(
     drift: &[super::DriftRow],
     ops: &mut Vec<PlannedOp>,
 ) -> Result<GeneratedPaths> {
-    let generated = collect(state, shims, drift);
+    let mut generated = collect(state, shims, drift);
     let Scope::Project { root } = scope else {
         return Ok(generated);
     };
     if !root.join(".git").exists() {
         return Ok(generated);
+    }
+    if !generated.held.is_empty() {
+        let committed = crate::commit_offer::committed_inventory(root).map_err(|error| {
+            crate::error::CoreError::GitFailed {
+                command: "read committed generated inventory".to_owned(),
+                stderr: if error.timed_out() {
+                    "inventory read timed out".to_owned()
+                } else {
+                    error.said().join("\n")
+                },
+            }
+        })?;
+        generated.held.retain(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .is_some_and(|relative| committed.contains(&crate::paths::slashed(relative)))
+        });
     }
     let path = root.join(INVENTORY);
     // A project that renders nothing gets no inventory, and one that
