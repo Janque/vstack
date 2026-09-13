@@ -8,6 +8,7 @@ import type {
   Manifest_Serialize,
   ObservedItem,
   PackageFile,
+  ProvenanceRow,
   Scope,
   UpdateRow,
   VersionRow,
@@ -385,6 +386,48 @@ describe("the words the package page shows", () => {
     expect(header(host)).toContain("What this project installed.");
     expect(header(host)).not.toContain("What the other project installed.");
   });
+
+  // libraryProvenance seeds rows with no position for missing copies.
+  it.each<[Project[], string | null, "observed" | "seeded"]>([
+    [[], "Here.", "observed"],
+    [[HYPR], "Here.", "observed"],
+    [[HYPR], null, "observed"],
+    [[HYPR], null, "seeded"],
+  ])(
+    "reads the missing copy's record: copies=%j summary=%s other=%s",
+    async (installed, summary, elsewhere) => {
+      useUpdatesStore.setState({
+        rows: [{ ...updateRow(VG), filesMissing: true }],
+      });
+      const host = await openPage(VG, installed, { [scopeKey(VG)]: PLAIN });
+      const seeded: ProvenanceRow = {
+        scope: VG,
+        kind: "skill",
+        name: "gh",
+        harness: "claude",
+        at: null,
+        origin: { origin: "marketplace", source: "cat", repo: "o/r" },
+        summary,
+        package: { kind: "skill", name: "gh" },
+      };
+      act(() => {
+        useProvenanceStore.setState({
+          rows: [
+            ...useProvenanceStore.getState().rows.map((row) => ({
+              ...row,
+              summary: "Elsewhere.",
+            })),
+            ...(elsewhere === "seeded"
+              ? [{ ...seeded, scope: HYPR, summary: "Elsewhere's record." }]
+              : []),
+            seeded,
+          ],
+        });
+      });
+
+      expect(header(host)).toBe(`gh${summary ?? ""}`);
+    },
+  );
 });
 
 describe("what the package page says instead of Update", () => {

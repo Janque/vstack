@@ -11,7 +11,7 @@ import type {
 import { PLACE_COUNTING_LABEL, PLACE_UNCHECKED_LABEL } from "@/lib/copy";
 import { observedAt, type PackageIdentity, packageKey } from "@/lib/derive";
 import type { ReadState } from "@/lib/read-state";
-import { scopeKey } from "@/lib/scope";
+import { sameScope, scopeKey } from "@/lib/scope";
 import { useProvenanceStore } from "@/stores/provenance";
 import { useScanStore } from "@/stores/scan";
 
@@ -182,10 +182,13 @@ export function useSummaryIndex(): SummaryOf {
 
 /** The same words for a package the records account for, for the rows no
  *  observation is left of. Stale for the same reason, and never null for
- *  it. */
-export function useRecordedSummaryIndex(): RecordedSummaryOf {
+ *  it. A scope restricts the lookup to that place. */
+export function useRecordedSummaryIndex(scope?: Scope): RecordedSummaryOf {
   const rows = useProvenanceStore((s) => s.rows);
-  return useMemo(() => recordedSummaryIndex(rows), [rows]);
+  return useMemo(() => {
+    const here = scope ? rows.filter((r) => sameScope(r.scope, scope)) : rows;
+    return recordedSummaryIndex(here);
+  }, [rows, scope]);
 }
 
 /** The same index for a component, rebuilt only when the join changes:
