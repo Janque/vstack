@@ -200,8 +200,9 @@ pub(super) fn orphans(
         // that did resolve has already said everything it wants installed,
         // so an entry it did not ask for — a harness dropped from its list —
         // is stranded and must be cleaned up like any other orphan.
-        let unreachable_source = manifest.declared(entry.kind).contains_key(&entry.name)
-            && !state.processed.contains(&(entry.kind, entry.name.clone()));
+        let departed_harness = state.processed.contains(&(entry.kind, entry.name.clone()));
+        let unreachable_source =
+            manifest.declared(entry.kind).contains_key(&entry.name) && !departed_harness;
         let named = options.named_for_removal(entry.kind, &entry.name);
         // An installation something else brought in was derived from a
         // declaration, and the catalog it came from is where that reason is
@@ -232,7 +233,7 @@ pub(super) fn orphans(
         let unneeded = derived_only(entry);
         let unfiltered = options.removal_filter.is_none();
         let removable = (options.remove_orphans && (named || unfiltered))
-            || (options.sweep_unneeded && unneeded);
+            || (options.sweep_unneeded && (unneeded || departed_harness));
         drift.push(DriftRow {
             kind: entry.kind,
             name: entry.name.clone(),
@@ -259,11 +260,11 @@ pub(super) fn orphans(
         // never takes bytes a record could vouch for and does not —
         // `edit_holds`' doc draws that line; only naming the item, or
         // asking for edits to be discarded, takes what it holds.
-        let fully_kept = entry
-            .emitted
-            .as_ref()
-            .is_some_and(|emitted| emitted.paths.iter().all(|path| guard.keep.contains(path)));
-        if !named && !options.overwrite_edited && !fully_kept && edit_holds(env, scope, entry) {
+        let mut removable_entry = entry.clone();
+        if let Some(emitted) = &mut removable_entry.emitted {
+            emitted.paths.retain(|path| !guard.keep.contains(path));
+        }
+        if !named && !options.overwrite_edited && edit_holds(env, scope, &removable_entry) {
             drift.push(DriftRow {
                 kind: entry.kind,
                 name: entry.name.clone(),

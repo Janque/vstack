@@ -143,7 +143,8 @@ pub enum ConfigEdit {
     /// stays, whoever put it in the directory.
     OpencodePruneInstructions {
         prefix: String,
-        keep: Vec<String>,
+        /// Map each retained reference to whether its Bash permission must be kept.
+        keep: std::collections::BTreeMap<String, bool>,
     },
     /// codex config.toml: text-level `[features] hooks = true` merge that
     /// preserves comments and ordering.
@@ -159,6 +160,20 @@ pub enum ConfigEdit {
 }
 
 impl ConfigEdit {
+    /// Composed OpenCode cleanup may retire a document containing only our schema.
+    pub(crate) fn removes_empty_document(edits: &[Self], current: &str) -> Result<bool, String> {
+        let prunes = |edit: &Self| matches!(edit, Self::OpencodePruneInstructions { .. });
+        if !edits.iter().any(prunes) {
+            return Ok(false);
+        }
+        let updated = edits
+            .iter()
+            .try_fold(current.to_owned(), |text, edit| edit.apply(&text))?;
+        let value: Value = serde_json::from_str(&updated).map_err(|e| e.to_string())?;
+        let mut empty = Map::new();
+        opencode_schema(&mut empty);
+        Ok(value == json!({}) || value == Value::Object(empty))
+    }
     pub fn apply(&self, current: &str) -> Result<String, String> {
         match self {
             ConfigEdit::CodexEnableHooksFeature => Ok(codex_enable_hooks(current)),
@@ -243,13 +258,18 @@ impl ConfigEdit {
             ConfigEdit::OpencodePruneInstructions { prefix, keep } => {
                 if let Some(list) = object.get_mut("instructions").and_then(Value::as_array_mut) {
                     list.retain(|v| {
-                        v.as_str().is_none_or(|row| {
-                            !row.starts_with(prefix) || keep.iter().any(|k| k == row)
-                        })
+                        v.as_str()
+                            .is_none_or(|row| !row.starts_with(prefix) || keep.contains_key(row))
                     });
                     if list.is_empty() {
                         object.shift_remove("instructions");
                     }
+                }
+                if !keep.values().any(|bash| *bash)
+                    && object.get("permission").and_then(|v| v.get("bash"))
+                        == Some(&json!({"*": "ask"}))
+                {
+                    remove_from_map(object, "permission", "bash");
                 }
                 Ok(())
             }
