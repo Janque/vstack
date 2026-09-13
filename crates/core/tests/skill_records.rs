@@ -179,6 +179,66 @@ fn an_orphaned_install_comes_off_by_the_paths_it_recorded() {
     assert!(settled(&f));
 }
 
+/// Orphan cleanup preserves shared bytes and retains ownership of edited trees.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn shared_orphans_keep_bytes_and_ownership_until_removal_is_safe() {
+    for (harnesses, edit) in [
+        ("\"codex\", \"opencode\"", None),
+        ("\"opencode\"", Some("user edit\n")),
+    ] {
+        let f = fixture();
+        declare(&f, harnesses);
+        apply_now(&f);
+        let shared = f.project.join(".agents/skills/ship");
+        let departed = "skill:ship:opencode";
+        let remaining = "skill:ship:codex";
+        assert_eq!(recorded_paths(&f, departed), vec![shared.clone()]);
+        let lock_path = f.project.join(".kendex-lock.json");
+        match edit {
+            Some(text) => fs::write(shared.join("SKILL.md"), text).unwrap(),
+            None => {
+                // Refresh can retain a departed record while a sibling re-renders.
+                let mut recorded = kendex_core::lock::load(&lock_path).unwrap();
+                recorded.entries.get_mut(departed).unwrap().rendered_hash =
+                    Some("stale-render".into());
+                kendex_core::lock::save(&lock_path, &recorded).unwrap();
+            }
+        }
+        let bytes = fs::read(shared.join("SKILL.md")).unwrap();
+        declare(&f, "\"codex\"");
+        let mut options = PlanOptions {
+            remove_orphans: true,
+            ..PlanOptions::default()
+        };
+        let report = plan_apply(&f.env, &f.scope, &options).unwrap();
+        let conflicted = report
+            .drift
+            .iter()
+            .any(|row| row.state == DriftState::Conflict);
+        assert_eq!(conflicted, edit.is_some());
+        apply::execute(&f.env, &report.plan).unwrap();
+        let recorded = kendex_core::lock::load(&lock_path).unwrap();
+        assert_eq!(recorded.entries.contains_key(departed), edit.is_some());
+        assert_eq!(recorded.entries.contains_key(remaining), edit.is_none());
+        assert_eq!(fs::read(shared.join("SKILL.md")).unwrap(), bytes);
+        options.overwrite_edited = true;
+        let report = plan_apply(&f.env, &f.scope, &options).unwrap();
+        apply::execute(&f.env, &report.plan).unwrap();
+        assert!(settled(&f));
+        let recorded = kendex_core::lock::load(&lock_path).unwrap();
+        assert!(!recorded.entries.contains_key(departed));
+        assert_eq!(recorded_paths(&f, remaining), vec![shared.clone()]);
+        declare(&f, "");
+        options.overwrite_edited = false;
+        let report = plan_apply(&f.env, &f.scope, &options).unwrap();
+        apply::execute(&f.env, &report.plan).unwrap();
+        assert!(!shared.exists());
+        let recorded = kendex_core::lock::load(&lock_path).unwrap();
+        assert!(recorded.entries.is_empty());
+    }
+}
+
 /// An install this pass holds plans no replacement, so what it recorded
 /// is still what runs. Judged by the render instead, the old link came off
 /// while the tree it connected stayed held, and nothing was written after.

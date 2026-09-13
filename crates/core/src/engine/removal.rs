@@ -137,17 +137,20 @@ pub(super) fn removal_ops(
 /// a second op with nothing left to do.
 pub(super) struct TrashGuard {
     keep: BTreeSet<PathBuf>,
+    protected: BTreeSet<PathBuf>,
     trashed: BTreeSet<PathBuf>,
 }
 
 impl TrashGuard {
-    pub(super) fn new(items: &[desired::Desired]) -> TrashGuard {
-        let keep = items
+    pub(super) fn new(items: &[desired::Desired], keep: BTreeSet<PathBuf>) -> TrashGuard {
+        let protected = items
             .iter()
             .flat_map(|item| item.artifact.paths())
+            .chain(keep.iter().cloned())
             .collect();
         TrashGuard {
             keep,
+            protected,
             trashed: BTreeSet::new(),
         }
     }
@@ -156,7 +159,7 @@ impl TrashGuard {
         let Op::Trash { path, .. } = op else {
             return true;
         };
-        !self.keep.contains(path) && self.trashed.insert(path.clone())
+        !self.protected.contains(path) && self.trashed.insert(path.clone())
     }
 
     pub(super) fn extend(
@@ -256,7 +259,11 @@ pub(super) fn orphans(
         // never takes bytes a record could vouch for and does not —
         // `edit_holds`' doc draws that line; only naming the item, or
         // asking for edits to be discarded, takes what it holds.
-        if !named && !options.overwrite_edited && edit_holds(env, scope, entry) {
+        let fully_kept = entry
+            .emitted
+            .as_ref()
+            .is_some_and(|emitted| emitted.paths.iter().all(|path| guard.keep.contains(path)));
+        if !named && !options.overwrite_edited && !fully_kept && edit_holds(env, scope, entry) {
             drift.push(DriftRow {
                 kind: entry.kind,
                 name: entry.name.clone(),
