@@ -1,0 +1,1 @@
+- Refresh reports final Pi safety and conflicts once, confirms its writes, and closes settled writes with commit handling, counts, and a drift snapshot on refusal or cancellation.

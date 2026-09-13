@@ -1,4 +1,4 @@
-use kendex_core::engine::{PlanOptions, plan_apply};
+use kendex_core::engine::{EngineReport, PlanOptions, plan_apply};
 use kendex_core::env::Env;
 use kendex_core::lock::{load as load_lock, lock_path};
 
@@ -8,6 +8,7 @@ use super::engine_common::{
 };
 use super::ledger::{Wrote, say_ledger};
 use super::{CliResult, resolve_scopes, say, scope_label, warn};
+use super::{commit_offer::after_writing, offers::Blocked};
 use crate::scope::ScopeFilter;
 use crate::ui;
 
@@ -122,26 +123,25 @@ struct Closing {
     scored: Vec<kendex_core::engine::ItemSafety>,
 }
 
-/// What one scope's write came to: the plan it ended on, and what that
-/// plan applied.
+/// Final plan and known writes, including a stop after Pi settlement.
 struct Written {
     report: kendex_core::engine::EngineReport,
     /// `None` is a scope with nothing to write, up to date.
     count: Option<usize>,
+    stop: Option<Box<dyn std::error::Error>>,
+}
+
+fn print_diagnostics(env: &Env, report: &EngineReport, verbose: bool) -> Vec<Blocked> {
+    print_notes(report);
+    print_safety(report);
+    match verbose {
+        true => print_drift(env, report),
+        false => print_conflicts(env, report),
+    }
 }
 
 /// One scope's write: the yes it needs, the settle that yes covers, and
 /// the plan applied after it.
-///
-/// One question per scope, asked before anything is written: what the
-/// plan would add to or drop from the installed set, and what the settle
-/// would install. A settle writes the package and its record, so the plan
-/// is derived again after it, and that plan is the one applied and
-/// reported; asking again for it would be asking twice about one change.
-/// What that plan adds beyond the one the yes covered, a registration the
-/// settled carrier made real, is shown and asked about once more before
-/// it is written: a yes given to one list is no yes to a longer one. A
-/// scope settling nothing keeps the plan it was shown.
 ///
 /// One closing line for every path: a run that first asked about what it
 /// installs still ends on the same ledger, since the outcomes it has to
@@ -155,6 +155,7 @@ fn write_scope(
     pending: &[String],
     options: &PlanOptions,
     yes: bool,
+    report_after_settle: impl FnOnce(&kendex_core::engine::EngineReport),
 ) -> Result<Written, Box<dyn std::error::Error>> {
     if pending.is_empty() {
         let count = match (report.plan.is_empty(), report.set_changes.is_empty()) {
@@ -165,7 +166,11 @@ fn write_scope(
                 confirm_and_apply(env, &report, yes).map(Some)?
             }
         };
-        return Ok(Written { report, count });
+        return Ok(Written {
+            report,
+            count,
+            stop: None,
+        });
     }
     print_set_changes(scope, &report);
     for name in pending {
@@ -186,6 +191,9 @@ fn write_scope(
         let _planning = ui::spinner(&format!("planning {}", scope_label(scope)));
         plan_apply(env, scope, options)?
     };
+    // The carrier can make hooks enforceable. Show their diagnostics
+    // before confirming the final writes, using this plan for the ledger.
+    report_after_settle(&after);
     let approved: std::collections::BTreeSet<String> =
         report.plan.ops.iter().map(|op| op.line()).collect();
     let added_changes: Vec<_> = after
@@ -212,18 +220,12 @@ fn write_scope(
         for line in &added_ops {
             say(&format!("  - {line}"));
         }
-        ask_before_writing(
-            &format!(
-                "apply {added} more change{}?",
-                if added == 1 { "" } else { "s" }
-            ),
-            yes,
-        )?;
     }
-    let applied = apply_report(env, &after)?;
+    let applied = confirm_and_apply(env, &after, yes);
     Ok(Written {
         report: after,
-        count: Some(applied + settled),
+        count: Some(settled + applied.as_ref().map_or(0, |count| *count)),
+        stop: applied.err(),
     })
 }
 
@@ -276,7 +278,7 @@ pub fn run(
             let _planning = ui::spinner(&format!("planning {}", scope_label(&scope)));
             plan_apply(env, &scope, &options)
         };
-        let mut report = match planned {
+        let report = match planned {
             Ok(report) => report,
             Err(error) => {
                 failures.push(error.to_string());
@@ -287,13 +289,11 @@ pub fn run(
         // install `update-pi` owns, and its record is machine-local: a
         // clone carries the package and no record, and this plan reports
         // every such package as drift. What the settle would install is
-        // read here, to be shown before the yes that lets it write, and
-        // its rows leave this plan's drift before that is printed: a row
-        // naming update-pi for a package this run settles is a remedy the
-        // reader would act on for nothing. A package it would not settle
-        // stays drift in the plan derived after the settle, and that row
-        // fails the run. The record refusing to read is what stops the
-        // scope here.
+        // read here, to be shown before the yes that lets it write. The
+        // diagnostics come from the plan derived after settlement, so a
+        // package this run settles never prints a stale update-pi remedy.
+        // A package it would not settle stays drift and fails the run.
+        // The record refusing to read is what stops the scope here.
         let pending = match super::update_pi::pending_settle(env, &scope) {
             Ok(pending) => pending,
             Err(error) => {
@@ -301,30 +301,23 @@ pub fn run(
                 continue;
             }
         };
-        report.drift.retain(|row| {
-            row.kind != kendex_core::model::ItemKind::PiExtension || !pending.contains(&row.name)
-        });
-        print_notes(&report);
-        // Refresh plans and writes like apply, so it says what the rules
-        // found before the confirm, the way apply does.
-        print_safety(&report);
-        let blocked = match verbose {
-            true => print_drift(env, &report),
-            false => print_conflicts(env, &report),
-        };
+        let mut blocked = Vec::new();
         let lock = load_lock(&lock_path(env, &scope))?;
         // A scope settling nothing is reported off this plan, and a run
         // that refused every install is not "nothing installed": a scope
         // carrying a refusal is never passed over. A scope that settles is
         // reported off the plan derived after its settle.
         if pending.is_empty() {
+            blocked = print_diagnostics(env, &report, verbose);
             failures.extend(refresh_failures(&report));
             if lock.entries.is_empty() && report.plan.is_empty() && blocked.is_empty() {
                 continue;
             }
         }
         refreshed_anything = true;
-        match write_scope(env, &scope, report, &pending, &options, yes) {
+        match write_scope(env, &scope, report, &pending, &options, yes, |after| {
+            blocked = print_diagnostics(env, after, verbose);
+        }) {
             Ok(written) => {
                 if !pending.is_empty() {
                     failures.extend(refresh_failures(&written.report));
@@ -340,6 +333,16 @@ pub fn run(
                     blocked,
                     scored: written.report.safety.clone(),
                 });
+                if let Some(error) = written.stop {
+                    if ui::cancelled(error.as_ref()) {
+                        cancelled = Some(error);
+                        break;
+                    }
+                    failures.push(error.to_string());
+                    if let Err(error) = after_writing(env, &scope, &written.report.generated) {
+                        failures.push(error.to_string());
+                    }
+                }
             }
             // A cancel is the reader stopping the run, not one scope
             // failing to refresh. Collected as a failure it would come out
@@ -360,6 +363,9 @@ pub fn run(
         }
     }
 
+    for failure in &failures {
+        super::fail(&format!("failed: {}", failure));
+    }
     finish_scopes(env, &reached, closing);
     if let Some(error) = cancelled {
         return Err(error);
@@ -370,9 +376,6 @@ pub fn run(
         return Ok(());
     }
     if !failures.is_empty() {
-        for failure in &failures {
-            super::fail(&format!("failed: {}", failure));
-        }
         return Err(format!("failed to refresh {} item/source(s)", failures.len()).into());
     }
     Ok(())
