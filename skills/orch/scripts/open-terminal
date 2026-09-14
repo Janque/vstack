@@ -24,6 +24,7 @@ ot_message() { # REASON FIELD=VALUE...
     items-missing) text='Specify a work item.' ;;
     tracker-invalid) text='The tracker must be linear or github.' ;;
     command-missing) text='Select a harness or a custom command.' ;;
+    cmd-unbalanced-quote) text='Put the brief in a file and reference it, or escape the quote.' ;;
     desktop-harness) text='Use the Codex Desktop thread tools for this harness.' ;;
     mode-override) text='The explicit GUI option overrides the detected tmux mode.' ;;
     verify-seconds-invalid) text='The verification timeout must be a positive integer in seconds.' ;;
@@ -590,6 +591,21 @@ start_cmd() {
   esac
 }
 
+# GUI launches use Bash, while tmux uses the pane shell. Their common rule is
+# that a backslash cannot escape a quote from inside single quotes.
+cmd_has_unbalanced_quote() {
+  local text="$1" quote="" char escaped=false i
+  for ((i = 0; i < ${#text}; i++)); do
+    char="${text:i:1}"
+    if [[ "$escaped" == true ]]; then escaped=false; continue; fi
+    if [[ "$quote" != "'" && "$char" == \\ ]]; then escaped=true; continue; fi
+    if [[ -z "$quote" && ( "$char" == "'" || "$char" == '"' ) ]]; then quote="$char"
+    elif [[ "$char" == "$quote" ]]; then quote=""
+    fi
+  done
+  [[ -n "$quote" ]]
+}
+
 # The composer of the main TUI, at column 0: the harness's prompt marker
 # followed by the NON-BREAKING space it pads the input line with. That padding
 # is the whole discriminator, and it is spelled as bytes rather than typed,
@@ -955,6 +971,8 @@ for raw in "${ITEMS[@]}"; do
       ot_message lane-selected "lane=$LANE_ENV"
     fi
   fi
+  cmd="$(start_cmd "$item" "$repo")"
+  cmd_has_unbalanced_quote "$cmd" && { ot_message cmd-unbalanced-quote "item=$item" >&2; exit 1; }
   # The worktree create is the ownership claim: exit 75 means another session
   # holds this item, which skips it without touching its siblings. Any other
   # failure is this item's alone — the batch continues so one broken item
