@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""Compare each Arch recipe's PKGBUILD with its .SRCINFO and, with --remote,
+with what the AUR publishes.
+
+The local check compares PKGBUILD and .SRCINFO under packaging/arch/<name>/.
+The remote check clones each AUR repository over HTTPS and diffs the
+published files against this tree. Without --remote, the script says that
+publication was not checked.
+
+Every refusal opens with one keyed line, `check-aur-sync: <key>=<value>`:
+  drift=<count>    the recipes disagree, each finding named below it (exit 1)
+  missing=<path>   a recipe file this tree should hold is absent (exit 2)
+  unreadable=<what> a PKGBUILD or .SRCINFO could not be parsed (exit 2)
+  clone=<package>  the AUR repository could not be cloned (exit 2)
+
+--print-sources and --print-source-checksums are what tools/publish-aur reads
+to decide whether a release's downloads exist and match the recipe. A `git+`
+source is left out of both: it resolves whether or not a release exists,
+which is why kendex-git prints nothing and is never deferred. --print-files
+is the file set a recipe publishes: PKGBUILD, .SRCINFO, every scriptlet
+(`install=`, `changelog=`) and every local `source` entry (a patch) it names,
+which the remote check compares too and the local check requires to exist.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+AUR_REMOTE = "https://aur.archlinux.org"
+
+# Files compared with each published AUR repository. A recipe naming an
+# install scriptlet has it checked for existence, but none does today.
+PACKAGES = {
+    "kendex": ("packaging/arch/kendex", ("PKGBUILD", ".SRCINFO")),
+    "kendex-bin": ("packaging/arch/kendex-bin", ("PKGBUILD", ".SRCINFO")),
+    "kendex-git": ("packaging/arch/kendex-git", ("PKGBUILD", ".SRCINFO")),
+}
+
+# The whole field set this publication gate accepts, so that the
+# comparison is closed: a name outside it in either file is a finding, never
+# a field this check quietly skips. A helper variable in a PKGBUILD starts
+# with `_`, which is makepkg's own convention, and is the one name shape the
+# header may carry that is not a field.
+SUMS = ("sha256sums",)
+# Fields a package_* function may override; .SRCINFO repeats them per pkgname.
+SPLIT_KEYS = (
+    "pkgdesc", "arch", "url", "license", "groups",
+    "depends", "optdepends", "provides", "conflicts", "replaces",
+    "backup", "options", "install", "changelog",
+)
+PKGBASE_KEYS = SPLIT_KEYS + (
+    "pkgver", "pkgrel", "epoch",
+    "makedepends", "checkdepends", "noextract", "source", "validpgpkeys",
+) + SUMS
+# Fields that take an `_<arch>` suffix, one array per architecture.
+ARCH_FIELDS = (
+    "source", "depends", "makedepends", "checkdepends", "optdepends",
+    "provides", "conflicts", "replaces",
+) + SUMS
+SPLIT_ARCH_FIELDS = ("depends", "optdepends", "provides", "conflicts", "replaces")
+FUNCTION_NAME = r"[^ \t\r\n|&;()<>]+"
+
+
+def arch_field(key: str, arch_allowed) -> str | None:
+    """The field `key` is an `_<arch>` instance of, or None. An architecture
+    name can itself hold an underscore (x86_64), so this matches the field
+    prefix rather than splitting at the last underscore."""
+    for field in arch_allowed:
+        if key.startswith(field + "_") and len(key) > len(field) + 1:
+            return field
+    return None
+
+
+def is_field(key: str, allowed, arch_allowed) -> bool:
+    return key in allowed or arch_field(key, arch_allowed) is not None
+
+
+def known_keys(fields: dict[str, list[str]], allowed, arch_allowed) -> list[str]:
+    """Every field name in `fields`, in makepkg's order; the caller compares
+    exactly these plus the other side's, so nothing either file carries is
+    skipped."""
+    return [key for key in fields if is_field(key, allowed, arch_allowed)]
+
+
+def require_fields(where: str, names, allowed, arch_allowed, scope: str) -> None:
+    """Refuse a name that is neither a field nor a `_helper`: makepkg would
+    ignore it, and the .SRCINFO comparison would ignore it too."""
+    for name in names:
+        if name.startswith("_") or is_field(name, allowed, arch_allowed):
+            continue
+        raise CheckError(
+            "unreadable",
+            where,
+            f"{where}: {scope} assigns {name}, which is not a makepkg field "
+            "this check compares; a helper variable is named with a leading _",
+        )
+
+
+class CheckError(Exception):
+    """A refusal: `key` is the stable first-line key, `detail` the English under it."""
+
+    def __init__(self, key: str, value: str, detail: str) -> None:
+        super().__init__(detail)
+        self.key = key
+        self.value = value
+        self.detail = detail
+
+
+def refuse(error: CheckError) -> int:
+    print(f"check-aur-sync: {error.key}={error.value}", file=sys.stderr)
+    print(error.detail, file=sys.stderr)
+    return 2
+
+
+def expand(value: str, scalars: dict[str, str], where: str) -> str:
+    """Expand the $var / ${var} references makepkg resolves before .SRCINFO."""
+
+    def sub(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        if name not in scalars:
+            raise CheckError(
+                "unreadable",
+                where,
+                f"cannot expand ${{{name}}}: no plain assignment for it in the "
+                "PKGBUILD, so the .SRCINFO comparison would be guesswork",
+            )
+        return scalars[name]
+
+    return re.sub(r"\$\{(\w+)\}|\$(\w+)", sub, value)
+
+
+def shell_code(text: str, where: str) -> str:
+    """Return same-length text with quotes, comments, and here-documents blanked."""
+    code = []
+    quote = ""
+    escaped = comment = False
+    word_start = True
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if comment:
+            if char == "\n":
+                comment = False
+                word_start = True
+                code.append(char)
+            else:
+                code.append(" ")
+        elif quote:
+            if quote == "'":
+                if char == "'":
+                    quote = ""
+            elif escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            code.append(char if char == "\n" else " ")
+        elif escaped:
+            escaped = False
+            word_start = False
+            code.append(" ")
+        elif char == "\\":
+            escaped = True
+            code.append(" ")
+        elif char == "#" and word_start:
+            comment = True
+            code.append(" ")
+        elif char in "'\"":
+            quote = char
+            word_start = False
+            code.append(" ")
+        elif text.startswith("<<", index):
+            if text.startswith("<<<", index):
+                raise CheckError("unreadable", where, f"{where}: here-string syntax is unsupported")
+            operator_end = index + 2
+            strip_tabs = text[operator_end:operator_end + 1] == "-"
+            if strip_tabs:
+                operator_end += 1
+            delimiter_start = operator_end
+            while text[delimiter_start:delimiter_start + 1] in (" ", "\t"):
+                delimiter_start += 1
+            line_end = text.find("\n", delimiter_start)
+            if line_end < 0:
+                raise CheckError("unreadable", where, f"{where}: here-document opener has no data")
+            delimiter_quote = text[delimiter_start:delimiter_start + 1]
+            if delimiter_quote in ("'", '"'):
+                delimiter_end = text.find(delimiter_quote, delimiter_start + 1, line_end)
+                if delimiter_end < 0:
+                    raise CheckError("unreadable", where, f"{where}: nonconstant here-document")
+                delimiter = text[delimiter_start + 1:delimiter_end]
+                token_end = delimiter_end + 1
+            else:
+                match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text[delimiter_start:line_end])
+                if match is None:
+                    raise CheckError("unreadable", where, f"{where}: nonconstant here-document")
+                delimiter = match.group(0)
+                token_end = delimiter_start + len(delimiter)
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", delimiter) is None:
+                raise CheckError("unreadable", where, f"{where}: nonconstant here-document")
+            remainder = text[token_end:line_end]
+            if not re.fullmatch(r"[ \t]*|[ \t]+#[^\n]*", remainder):
+                raise CheckError("unreadable", where, f"{where}: unsupported here-document opener")
+
+            data_start = line_end + 1
+            delimiter_line = data_start
+            while True:
+                delimiter_line_end = text.find("\n", delimiter_line)
+                if delimiter_line_end < 0:
+                    delimiter_line_end = len(text)
+                candidate = text[delimiter_line:delimiter_line_end]
+                if strip_tabs:
+                    candidate = candidate.lstrip("\t")
+                if candidate == delimiter:
+                    break
+                if delimiter_line_end == len(text):
+                    raise CheckError("unreadable", where, f"{where}: no {delimiter} delimiter line")
+                delimiter_line = delimiter_line_end + 1
+
+            code.append(text[index:operator_end])
+            code.append(" " * (line_end - operator_end))
+            code.append("\n")
+            code.extend(c if c == "\n" else " " for c in text[data_start:delimiter_line_end])
+            if delimiter_line_end < len(text):
+                code.append("\n")
+                index = delimiter_line_end + 1
+            else:
+                index = delimiter_line_end
+            word_start = True
+            continue
+        else:
+            code.append(char)
+            word_start = char in " \t\r\n;&|()<>"
+        index += 1
+    return "".join(code)
+
+
+def parse_pkgbuild(path: Path) -> tuple[dict[str, list[str]], dict[str, dict[str, list[str]]]]:
+    """Return (pkgbase fields, {pkgname: overridden fields}).
+
+    A deliberately small parser rather than `source`ing the file: this runs in
+    CI over a file that produces a package, and sourcing it to read metadata is
+    a needless execution of packaging code.
+    """
+    where = str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+    text = path.read_text()
+    scalars: dict[str, str] = {}
+    fields: dict[str, list[str]] = {}
+
+    # Functions can sit between metadata assignments. Remove their complete
+    # bodies so later top-level assignments keep Bash's last-assignment semantics.
+    code = shell_code(text, where)
+    function = re.compile(r"^(?P<name>" + FUNCTION_NAME + r")[ \t]*\(\)\s*(?P<brace>\{)", re.MULTILINE)
+    functions: list[str] = []
+    header_parts = []
+    cursor = 0
+    while (match := function.search(code, cursor)) is not None:
+        line_end = code.find("\n", match.end("brace"))
+        if line_end < 0:
+            line_end = len(code)
+        tail = code[match.end("brace"):line_end]
+        one_line = re.fullmatch(r"[^{}\n]*}[ \t]*", tail)
+        if one_line is not None:
+            end = match.end("brace") + tail.rfind("}")
+        elif re.search(r"(?:^|[ \t;])}(?=$|[ \t;])", tail):
+            raise CheckError("unreadable", where, f"{where}: ambiguous function close")
+        else:
+            closing = re.search(r"^[ \t]*}[ \t]*$", code[line_end + 1:], re.MULTILINE)
+            if closing is None:
+                raise CheckError("unreadable", where, f"{where}: no supported function close")
+            close_line = line_end + 1 + closing.start()
+            if re.search(r"(?:^|[ \t\n;&|])\{(?=$|[ \t\n;&|])", code[match.end("brace"):close_line]): raise CheckError("unreadable", where, f"{where}: nested function brace is unsupported")
+            end = code.find("}", close_line, line_end + 1 + closing.end())
+        function_name = match.group("name")
+        header_parts.append(text[cursor:match.start()])
+        header_parts.append("\n" * text.count("\n", match.start(), end + 1))
+        functions.append(function_name)
+        cursor = end + 1
+    header_parts.append(text[cursor:])
+    header = "".join(header_parts)
+    if any(name.startswith("package_") for name in functions):
+        raise CheckError("unreadable", where, f"{where}: split-package functions are unsupported")
+
+    for name, values in assignments(header, where, scalars):
+        fields[name] = values
+        scalars[name] = values[0] if values else ""
+
+    if "pkgname" not in fields:
+        raise CheckError("unreadable", where, f"{where}: no pkgname assignment")
+    require_fields(where, fields, PKGBASE_KEYS + ("pkgname", "pkgbase"), ARCH_FIELDS, "the header")
+    for sums_key, sums in fields.items():
+        base = sums_key if sums_key in SUMS else arch_field(sums_key, SUMS)
+        if base is None:
+            continue
+        source_key = "source" + sums_key[len(base):]
+        sources = fields.get(source_key, [])
+        if len(sums) != len(sources):
+            raise CheckError(
+                "unreadable",
+                where,
+                f"{where}: declares {len(sources)} {source_key} entries and "
+                f"{len(sums)} {sums_key} entries; makepkg pairs them one to one",
+            )
+    # makepkg names the base after the first pkgname when the PKGBUILD sets none.
+    fields.setdefault("pkgbase", [fields["pkgname"][0]])
+
+    splits: dict[str, dict[str, list[str]]] = {}
+    # For a non-split package, makepkg uses the pkgname stanza as pkgbase fields.
+    if "package" in functions:
+        only = scalars.get("pkgname")
+        if only:
+            splits[only] = {}
+
+    return fields, splits
+
+
+def array_end(text: str, start: int, where: str) -> int:
+    """Index of the `)` closing the array opened at `start`, quotes respected.
+
+    Element text can contain parentheses, so depth counting alone is not enough.
+    """
+    depth, quote, index = 0, "", start
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    raise CheckError("unreadable", where, f"{where}: unterminated array assignment")
+
+
+def scalar_end(text: str, start: int) -> int:
+    """Return the end of one shell word used as a scalar value."""
+    quote, index = "", start
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        elif char in " \t\r\n;&|()<>":
+            return index
+        index += 1
+    return len(text)
+
+
+def assignments(text: str, where: str, scalars: dict[str, str]):
+    """Yield plain assignments after consuming every executable byte in `text`."""
+    index = 0
+    pattern = re.compile(r"([A-Za-z_]\w*)=")
+    while True:
+        while index < len(text) and text[index] in " \t\r\n":
+            index += 1
+        if index == len(text):
+            return
+        if text[index] == "#":
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        match = pattern.match(text, index)
+        if match is None:
+            line = text.count("\n", 0, index) + 1
+            raise CheckError("unreadable", where, f"{where}:{line}: expected a plain assignment")
+        name, start = match.group(1), match.end()
+        array = text[start:start + 1] == "("
+        if array:
+            end = array_end(text, start, where)
+            raw = text[start + 1 : end]
+        else:
+            end = scalar_end(text, start)
+            raw = text[start:end]
+        index = end + 1 if array else end
+        reference = r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"
+        literal = r"[A-Za-z0-9_.,:/+%=!@-]+" if array else r"[A-Za-z0-9_.,:/+%=!@#-]+"
+        word = r"(?:'[^'$]*'|\"(?:[^\"$`\\]|\\[\"\\\n]|" + reference + r")*\"|\\(?:[^\n$]|\n)|" + reference + "|" + literal + r")+"
+        grammar = r"(?:[ \t\r\n]+|^[ \t]*#[^\n]*(?:\n|$)|" + word + r")*" if array else word + r"?"
+        if re.fullmatch(grammar, raw, re.MULTILINE) is None:
+            raise CheckError("unreadable", where, f"{where}: {name} has an unsupported value")
+        try:
+            values = shlex.split(raw, comments=array)
+        except ValueError as error:
+            raise CheckError(
+                "unreadable",
+                where,
+                f"{where}: cannot parse the assignment to {name}: {error}. The "
+                f"value read as {raw!r}",
+            ) from None
+        yield name, [expand(value, scalars, where) for value in values]
+
+
+def parse_srcinfo(path: Path) -> tuple[dict[str, list[str]], dict[str, dict[str, list[str]]]]:
+    where = str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+    base: dict[str, list[str]] = {}
+    splits: dict[str, dict[str, list[str]]] = {}
+    current = base
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        if "=" not in line:
+            raise CheckError(
+                "unreadable", where, f"{where}:{number}: not a `key = value` line: {line!r}"
+            )
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key == "pkgname" and not line.startswith(("\t", " ")):
+            current = splits.setdefault(value, {})
+            base.setdefault("pkgname", []).append(value)
+            continue
+        if key == "pkgbase":
+            if current is not base or "pkgbase" in base:
+                raise CheckError("unreadable", where, f"{where}:{number}: pkgbase out of place")
+        elif current is base:
+            if not is_field(key, PKGBASE_KEYS, ARCH_FIELDS):
+                raise CheckError(
+                    "unreadable", where,
+                    f"{where}:{number}: {key} is not a supported makepkg --printsrcinfo field",
+                )
+        elif not is_field(key, SPLIT_KEYS, SPLIT_ARCH_FIELDS):
+            raise CheckError(
+                "unreadable", where,
+                f"{where}:{number}: {key} is not a field a pkgname stanza carries",
+            )
+        current.setdefault(key, []).append(value)
+    if "pkgbase" not in base:
+        raise CheckError("unreadable", where, f"{where}: no pkgbase line")
+    return base, splits
+
+
+def compare(label: str, expected: dict[str, list[str]], actual: dict[str, list[str]],
+            keys) -> list[str]:
+    problems = []
+    for key in keys:
+        want, have = expected.get(key), actual.get(key)
+        if want is None and have is None:
+            continue
+        if want != have:
+            problems.append(
+                f"{label}: {key} differs\n"
+                f"    PKGBUILD: {want if want is not None else '(absent)'}\n"
+                f"    .SRCINFO: {have if have is not None else '(absent)'}"
+            )
+    return problems
+
+
+def check_local(package: str, directory: Path) -> list[str]:
+    pkgbuild, splits = parse_pkgbuild(directory / "PKGBUILD")
+    base, srcsplits = parse_srcinfo(directory / ".SRCINFO")
+
+    # Exactly the fields either file carries, so an `epoch` or `groups` one side
+    # adds is a drift, not a name the comparison never asked about.
+    keys = ["pkgbase", "pkgname"]
+    for side in (pkgbuild, base):
+        for key in known_keys(side, PKGBASE_KEYS, ARCH_FIELDS):
+            if key not in keys:
+                keys.append(key)
+    problems = compare(package, pkgbuild, base, keys)
+
+    if set(splits) != set(srcsplits):
+        problems.append(
+            f"{package}: package_* functions {sorted(splits)} but .SRCINFO has "
+            f"stanzas {sorted(srcsplits)}"
+        )
+    for name in sorted(set(splits) & set(srcsplits)):
+        split_keys = []
+        for side in (splits[name], srcsplits[name]):
+            for key in known_keys(side, SPLIT_KEYS, SPLIT_ARCH_FIELDS):
+                if key not in split_keys:
+                    split_keys.append(key)
+        problems.extend(
+            compare(f"{package}/{name}", splits[name], srcsplits[name], split_keys)
+        )
+
+    # A scriptlet named in the header or by a package_* override, and a local
+    # source (a patch), must ship beside the recipe, or every AUR build of it
+    # fails on the missing file.
+    named: list[tuple[str, str]] = []
+    for fields in (pkgbuild, *splits.values()):
+        for key in ("install", "changelog"):
+            named.extend((key, name) for name in fields.get(key, []))
+    for key, values in pkgbuild.items():
+        if key == "source" or arch_field(key, ("source",)) is not None:
+            for value in values:
+                name = local_source(value)
+                if name is not None:
+                    named.append((key, name))
+    seen: set[tuple[str, str]] = set()
+    for key, name in named:
+        if (key, name) in seen:
+            continue
+        seen.add((key, name))
+        companion_path(directory, name, f"{package}: {key}={name}")
+    # A local source is also held to its pinned digest: the two files agree
+    # whether or not the patch was edited after the pin, and makepkg rejects
+    # a stale pin for every user.
+    problems.extend(local_source_digests(package, directory, pkgbuild))
+    return problems
+
+
+def local_source_digests(package: str, directory: Path, pkgbuild) -> list[str]:
+    """Each local source entry against the SHA-256 array of its own suffix,
+    `SKIP` honoured; a file that is missing was reported already."""
+    problems = []
+    for key, values in pkgbuild.items():
+        if key != "source" and arch_field(key, ("source",)) is None:
+            continue
+        suffix = key[len("source"):]
+        for sums_key in SUMS:
+            sums = pkgbuild.get(sums_key + suffix)
+            if sums is None:
+                continue
+            for index, value in enumerate(values):
+                name = local_source(value)
+                if name is None or index >= len(sums) or sums[index] == "SKIP":
+                    continue
+                path = companion_path(directory, name, f"{package}: {key}={name}")
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                if actual != sums[index].lower():
+                    problems.append(
+                        f"{package}: {sums_key}{suffix}[{index}] is {sums[index]} but {name} "
+                        f"hashes to {actual}; re-pin it (updpkgsums) and regenerate .SRCINFO"
+                    )
+    return problems
+
+
+REMOTE_SCHEMES = ("http://", "https://", "ftp://", "file://", "git://", "git+", "hg+", "svn+", "bzr+", "fossil+")
+
+
+def local_source(value: str) -> str | None:
+    """The file beside the recipe a `source` entry names, or None for a URL.
+    makepkg reads `name::source`; a local entry is a bare filename, so the
+    part after any alias is what must exist in the package directory."""
+    source = value.split("::", 1)[-1]
+    if source.startswith(REMOTE_SCHEMES) or "://" in source:
+        return None
+    return source
+
+
+def companion_path(directory: Path, name: str, label: str) -> Path:
+    """The canonical regular file for one normalized companion path."""
+    where = str(directory.relative_to(ROOT) / "PKGBUILD")
+    parts = name.split("/")
+    if (not name or Path(name).is_absolute() or Path(name).as_posix() != name
+            or any(part in ("", ".", "..") for part in parts)
+            or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in name)):
+        raise CheckError("unreadable", where, f"{directory.name}: companion path {name!r} is not normalized")
+    try:
+        root = directory.resolve(strict=True)
+        candidate = root.joinpath(*parts)
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise CheckError("unreadable", where, f"{label} names no file in {directory.relative_to(ROOT)}") from None
+    if not resolved.is_relative_to(root) or resolved != candidate or not resolved.is_file():
+        raise CheckError("unreadable", where, f"{label} is not a regular file without symbolic links inside {directory.relative_to(ROOT)}")
+    return resolved
+
+
+def companion_files(pkgbuild, splits) -> list[str]:
+    """Every file the recipe needs beside PKGBUILD and .SRCINFO, in order
+    and once: each scriptlet (`install=`, `changelog=`) and each local
+    `source` entry (a patch, a desktop file). Any of them left behind makes
+    every AUR build of the package fail on the missing file."""
+    files: list[str] = []
+    for fields in (pkgbuild, *splits.values()):
+        for key in ("install", "changelog"):
+            for name in fields.get(key, []):
+                if name not in files:
+                    files.append(name)
+    for key, values in pkgbuild.items():
+        if key != "source" and arch_field(key, ("source",)) is None:
+            continue
+        for value in values:
+            name = local_source(value)
+            if name is not None and name not in files:
+                files.append(name)
+    return files
+
+
+def recipe_files(directory: Path) -> tuple[str, ...]:
+    """Every file the recipe publishes: the two makepkg reads, then its
+    companion files."""
+    pkgbuild, splits = parse_pkgbuild(directory / "PKGBUILD")
+    files = ("PKGBUILD", ".SRCINFO", *companion_files(pkgbuild, splits))
+    for name in files:
+        companion_path(directory, name, f"{directory.name}: {name}")
+    return files
+
+
+def check_remote(package: str, directory: Path, files: tuple[str, ...]) -> list[str]:
+    files = recipe_files(directory)
+    with tempfile.TemporaryDirectory() as tmp:
+        clone = Path(tmp) / package
+        result = subprocess.run(
+            ["git", "clone", "--quiet", "--depth", "1", f"{AUR_REMOTE}/{package}.git", str(clone)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise CheckError(
+                "clone",
+                package,
+                f"cannot clone {AUR_REMOTE}/{package}.git, so NOTHING about the "
+                f"published package was checked: {result.stderr.strip()}",
+            )
+
+        problems = []
+        # A file the AUR tracks that the recipe no longer names is drift too:
+        # publish-aur removes it, and a hand edit that left one behind would
+        # otherwise read as in sync forever.
+        tree = subprocess.run(["git", "-C", str(clone), "ls-tree", "-rz", "--full-tree", "HEAD"], capture_output=True, check=True).stdout
+        published_files = {}
+        for entry in tree.split(b"\0"):
+            if not entry:
+                continue
+            metadata, raw_name = entry.split(b"\t", 1)
+            mode, kind, object_id = metadata.split(b" ", 2)
+            try:
+                name = raw_name.decode()
+            except UnicodeDecodeError:
+                raise CheckError("unreadable", package, f"{package}: non-UTF-8 AUR filename") from None
+            published_files[name] = (mode, kind, object_id)
+        for name in published_files:
+            if name not in files:
+                problems.append(f"{package}: {name} is published but the recipe no longer names it")
+        for name in files:
+            entry = published_files.get(name)
+            if entry is None:
+                problems.append(f"{package}: {name} is not published at all")
+                continue
+            mode, kind, object_id = entry
+            if kind != b"blob" or mode not in (b"100644", b"100755"):
+                problems.append(f"{package}: {name} is not published as a regular file")
+                continue
+            want_bytes = companion_path(directory, name, f"{package}: {name}").read_bytes()
+            have_bytes = subprocess.run(["git", "-C", str(clone), "cat-file", "blob", object_id.decode("ascii")], capture_output=True, check=True).stdout
+            if want_bytes == have_bytes:
+                continue
+            # A companion can be binary (an icon): compare bytes, and render a
+            # diff only when both sides are text.
+            try:
+                want = want_bytes.decode().splitlines(keepends=True)
+                have = have_bytes.decode().splitlines(keepends=True)
+            except UnicodeDecodeError:
+                problems.append(
+                    f"{package}: {name} on the AUR is not this repo's "
+                    f"({len(have_bytes)} bytes there, {len(want_bytes)} here; binary, no diff)"
+                )
+                continue
+            diff = "".join(
+                difflib.unified_diff(
+                    have, want, fromfile=f"aur/{package}/{name}",
+                    tofile=f"{directory.relative_to(ROOT)}/{name}",
+                )
+            )
+            problems.append(f"{package}: {name} on the AUR is not this repo's\n{diff}")
+        return problems
+
+
+def remote_sources(directory: Path) -> list[str]:
+    """The http(s) URLs a package's sources are fetched from, expanded.
+
+    `git+…` and local file sources are left out: they resolve regardless of
+    whether a release exists, which is the question the caller is asking.
+    """
+    fields, _ = parse_pkgbuild(directory / "PKGBUILD")
+    urls = []
+    for key, values in fields.items():
+        if key != "source" and not key.startswith("source_"):
+            continue
+        for value in values:
+            # makepkg allows `filename::url`.
+            url = value.split("::", 1)[-1]
+            if url.startswith(("http://", "https://")):
+                urls.append(url)
+    return urls
+
+
+def remote_source_checksums(directory: Path) -> list[tuple[str, str]]:
+    """Pair each HTTP(S) source with its declared SHA-256 digest.
+
+    makepkg pairs source and checksum arrays by index within each architecture
+    suffix: `source` with `sha256sums`, `source_x86_64` with `sha256sums_x86_64`.
+    Flattening the arrays first would pair a source with the wrong digest.
+    """
+    fields, _ = parse_pkgbuild(directory / "PKGBUILD")
+    paired = []
+    for key, values in fields.items():
+        if key != "source" and not key.startswith("source_"):
+            continue
+        sums_key = SUMS[0] + key[len("source"):]
+        sums = fields.get(sums_key, [])
+        # Publication requires SHA-256 specifically. parse_pkgbuild has already
+        # validated each declared digest array against its source array.
+        if sums_key not in fields:
+            raise CheckError(
+                "unreadable",
+                f"{directory.relative_to(ROOT)}/PKGBUILD",
+                f"{directory.name}/PKGBUILD declares {len(values)} {key} "
+                f"entries and {len(sums)} {sums_key} entries; makepkg pairs "
+                "them one to one",
+            )
+        for value, digest in zip(values, sums):
+            url = value.split("::", 1)[-1]
+            if not url.startswith(("http://", "https://")):
+                continue
+            paired.append((url, digest))
+    return paired
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="also diff the published AUR repositories (requires network)",
+    )
+    parser.add_argument(
+        "--print-sources",
+        action="store_true",
+        help="print the http(s) source URLs of the selected packages and exit",
+    )
+    parser.add_argument(
+        "--print-source-checksums",
+        action="store_true",
+        help="print each http(s) source URL and the sha256 the recipe declares for it",
+    )
+    parser.add_argument(
+        "--print-files",
+        action="store_true",
+        help="print the files each selected recipe publishes (PKGBUILD, .SRCINFO, its scriptlets)",
+    )
+    parser.add_argument(
+        "packages",
+        nargs="*",
+        choices=[*PACKAGES, []],
+        help="packages to check (default: all of them)",
+    )
+    args = parser.parse_args()
+    selected = {name: PACKAGES[name] for name in (args.packages or PACKAGES)}
+
+    if args.print_source_checksums:
+        try:
+            for _, (relative, _) in selected.items():
+                for url, digest in remote_source_checksums(ROOT / relative):
+                    print(f"{url}\t{digest}")
+        except CheckError as error:
+            return refuse(error)
+        return 0
+
+    if args.print_files:
+        try:
+            for _, (relative, _) in selected.items():
+                for name in recipe_files(ROOT / relative):
+                    print(name)
+        except CheckError as error:
+            return refuse(error)
+        return 0
+
+    if args.print_sources:
+        try:
+            for _, (relative, _) in selected.items():
+                for url in remote_sources(ROOT / relative):
+                    print(url)
+        except CheckError as error:
+            return refuse(error)
+        return 0
+
+    problems: list[str] = []
+    try:
+        for package, (relative, files) in selected.items():
+            directory = ROOT / relative
+            for name in files:
+                if not (directory / name).is_file():
+                    raise CheckError(
+                        "missing", f"{relative}/{name}", f"{relative}/{name} is missing"
+                    )
+            problems.extend(check_local(package, directory))
+            if args.remote:
+                problems.extend(check_remote(package, directory, files))
+    except CheckError as error:
+        return refuse(error)
+
+    if problems:
+        print(f"check-aur-sync: drift={len(problems)}", file=sys.stderr)
+        print("the Arch recipes have drifted:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        if args.remote:
+            print(
+                "\nPublish the repo recipes with tools/publish-aur; the AUR "
+                "repository is never the source of truth.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\nRegenerate the .SRCINFO from its PKGBUILD: in the package's "
+                "directory, makepkg --printsrcinfo > .SRCINFO",
+                file=sys.stderr,
+            )
+        return 1
+
+    packages = ", ".join(selected)
+    if args.remote:
+        print(f"AUR recipes match this repo ({packages})")
+    else:
+        print(f"Arch PKGBUILD/.SRCINFO agree ({packages})")
+        print(
+            "NOT CHECKED: what aur.archlinux.org actually publishes. That needs "
+            "network; run tools/check-aur-sync --remote."
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
