@@ -66,6 +66,7 @@ hooks = [
   "code-quality-load-check",
   "reviewer-read-only",
   "reviewer-stop-check",
+  "lane-mail-check",
 ]
 
 [bundles.orchestration]
@@ -80,6 +81,7 @@ skills = [
   "reviewer",
   "linear",
 ]
+hooks = ["lane-mail-check"]
 
 [bundles.code-review]
 description = "The review agents and the skills that run a review"
