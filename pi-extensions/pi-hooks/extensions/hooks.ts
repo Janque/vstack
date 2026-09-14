@@ -84,6 +84,19 @@ export default function piHooks(pi: ExtensionAPI): void {
 	let settles = 0;
 	let steeredThisRun = false;
 
+	/**
+	 * Releases the dispatches that steered, once a settle their steers caused
+	 * has been dispatched. Pi starts the steered run without awaiting it, and
+	 * print mode disposes the runtime as soon as the `agent_settled` emit it
+	 * awaits returns: a dispatch returning before its follow-on leaves that
+	 * dispatch a ctx whose getters throw, and the agent's answer unprinted.
+	 *
+	 * A set, because settles can overlap and each may steer. A settle releases
+	 * every waiter armed before it began; one armed after it began is left to
+	 * the next settle, which that waiter's own steer causes.
+	 */
+	const steerers = new Set<() => void>();
+
 	/** The person's channel: a UI notification, where there is a UI to take it. */
 	const notify = (ctx: ExtensionContext, level: "info" | "warning") => (content: string) => {
 		if (ctx.hasUI) ctx.ui.notify(content, level);
@@ -267,7 +280,7 @@ export default function piHooks(pi: ExtensionAPI): void {
 	// K+1 of them. kendex still renders those registrations under the
 	// `turn_end` key (`caps.rs::pi_listener`); this is the listener that reads
 	// that key, and the clippy lane below is what `turn_end` is still for.
-	pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
+	const consultStop = async (ctx: ExtensionContext): Promise<undefined> => {
 		const project = ctx.cwd ? projectRoot(ctx.cwd) : undefined;
 		recordProjectTrust(ctx, project);
 		const cfg = readConfig(ctx.cwd, project);
@@ -290,9 +303,13 @@ export default function piHooks(pi: ExtensionAPI): void {
 		//
 		// `display: false` leaves interactive rendering to the notification
 		// beside it, which a headless session never sees.
+		let steered: Promise<void> | undefined;
 		const say = (content: string) => {
 			if (!stopHookActive) steeredThisRun = true;
 			pi.sendMessage({ customType: "kendex-hook", content, display: false }, { triggerTurn: !stopHookActive });
+			// Armed only once the steer went out: a send that threw starts
+			// no run, and a wait on a settle that never comes hangs Pi.
+			if (!stopHookActive) steered ??= new Promise<void>((resolve) => steerers.add(resolve));
 			if (ctx.hasUI) ctx.ui.notify(content, "warning");
 		};
 
@@ -314,7 +331,20 @@ export default function piHooks(pi: ExtensionAPI): void {
 		);
 		if (run.unreadable !== undefined) deliver(say, unreadableLine(TURN_END_LISTENER, run.unreadable));
 		report(run.results, ctx, say);
+		await steered;
 		return undefined;
+	};
+
+	pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
+		// Released on every exit of this dispatch, the early return and a throw
+		// included, since the dispatches whose steers caused it may be waiting.
+		const causes = [...steerers];
+		steerers.clear();
+		try {
+			return await consultStop(ctx);
+		} finally {
+			for (const release of causes) release();
+		}
 	});
 
 	pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
