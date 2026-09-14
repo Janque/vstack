@@ -24,21 +24,30 @@ message() {
 
 repo="vanillagreencom/kendex"
 version="latest"
+version_set=0
+git_channel=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)
       [ "$#" -ge 2 ] && [ -n "$2" ] || { message missing-option-value --version "A version must follow --version." >&2; exit 2; }
-      version="$2"; shift 2 ;;
+      version="$2"; version_set=1; shift 2 ;;
+    --git)
+      git_channel=1; shift ;;
     -h|--help)
-      message usage install.sh "Usage: install.sh [--version vX.Y.Z]"
+      message usage install.sh "Usage: install.sh [--git | --version vX.Y.Z]"
       exit 0
       ;;
     *) message unknown-option "$1" "The installer does not accept this option." >&2; exit 2 ;;
   esac
 done
 
-for cmd in curl install; do
+[ "$git_channel" -eq 0 ] || [ "$version_set" -eq 0 ] || {
+  message conflicting-options "--git --version" "Choose the rolling main build or a tagged version." >&2
+  exit 2
+}
+
+for cmd in awk curl install; do
   command -v "$cmd" >/dev/null || { message missing-command "$cmd" "Install this required command before running the installer." >&2; exit 1; }
 done
 
@@ -57,12 +66,19 @@ case "$os-$arch" in
     exit 1 ;;
 esac
 
-if [ "$version" = latest ]; then
+if [ "$git_channel" -eq 1 ]; then
+  version="rolling-main"
+elif [ "$version" = latest ]; then
   version="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
 fi
 [ -n "$version" ] || { message release-unavailable latest "The latest release could not be resolved." >&2; exit 1; }
 plain="${version#v}"
+record_channel=release
+if [ "$git_channel" -eq 1 ]; then
+  plain="main"
+  record_channel=main
+fi
 base="https://github.com/$repo/releases/download/$version"
 
 # One directory for everything downloaded, removed however this run ends.
@@ -71,6 +87,50 @@ base="https://github.com/$repo/releases/download/$version"
 # fills a machine over time.
 work="$(mktemp -d)" || { message temporary-directory-unavailable "${TMPDIR:-/tmp}" "No temporary download directory could be created." >&2; exit 1; }
 trap 'rm -rf "$work"' EXIT
+
+# Extract one URL from a map in the workflow-owned feed format. The producer
+# writes one entry per line and never escapes its HTTPS URLs.
+feed_url() {
+  awk -v section="$1" -v key="$2" '
+    $0 ~ "^[[:space:]]*\"" section "\":[[:space:]]*\\{" { inside=1; next }
+    inside && $0 ~ /^[[:space:]]*}/ { exit }
+    inside {
+      prefix="\"" key "\": \""
+      at=index($0, prefix)
+      if (at) {
+        value=substr($0, at + length(prefix))
+        sub(/\".*/, "", value)
+        print value
+        found++
+      }
+    }
+    END { if (found != 1) exit 1 }
+  ' "$work/feed.json"
+}
+
+command_url="$base/kendex-$target"
+app_url="$base/kendex_${plain}_${appimage_arch:-}.AppImage"
+icon_ref="$version"
+if [ "$git_channel" -eq 1 ]; then
+  pointer="$base/feed.json"
+  if ! curl -fSL --proto '=https' -o "$work/feed.json" "$pointer"; then
+    message main-pointer-download-failed "$pointer" "The main build pointer could not be downloaded." >&2
+    exit 1
+  fi
+  if ! command_url="$(feed_url assets "$target")"; then
+    message main-pointer-invalid "$target" "The main build pointer has no complete download set for this target." >&2
+    exit 1
+  fi
+  if [ "$kind" = linux ] && ! app_url="$(feed_url apps "$target")"; then
+    message main-pointer-invalid "$target" "The main build pointer has no complete download set for this target." >&2
+    exit 1
+  fi
+  icon_ref=$(sed -n 's/^[[:space:]]*"commit": "\([0-9a-f]*\)",*$/\1/p' "$work/feed.json")
+  [ "${#icon_ref}" -eq 40 ] || {
+    message main-pointer-invalid commit "The main build pointer has no source commit." >&2
+    exit 1
+  }
+fi
 
 # Where kendex keeps its own state, spelled the way the app's resolver
 # spells it — `dirs::data_dir()`, which is XDG on Linux and Application
@@ -110,12 +170,12 @@ install_cli() {
   # lacks; any other failure is the network, not the release. Testing curl
   # in the condition and reading `$?` in the else is what keeps that code:
   # `if ! curl` would hand back the negation instead.
-  if curl -fSL --proto '=https' -o "$work/kendex" "$base/kendex-$target"; then
+  if curl -fSL --proto '=https' -o "$work/kendex" "$command_url"; then
     :
   else
     rc=$?
     message command-download-failed "$rc" "The kendex command could not be downloaded." >&2
-    message command-download-url "$base/kendex-$target" "The command download used this URL." >&2
+    message command-download-url "$command_url" "The command download used this URL." >&2
     [ "$rc" -eq 22 ] && message release-http-error "$target" "The release server returned an HTTP error for this target." >&2
     exit 1
   fi
@@ -156,7 +216,7 @@ install_cli() {
   # run continues.
   state="$(kendex_data)"
   if ! { mkdir -p "$state" 2>/dev/null \
-     && printf '%s\n' "$bindir/kendex" > "$state/installed-command"; }; then
+     && printf '%s\n%s\n' "$bindir/kendex" "$record_channel" > "$state/installed-command"; }; then
     message command-record-failed "$state/installed-command" "The command identity could not be recorded; the desktop app will not update it." >&2
   fi
 }
@@ -228,7 +288,7 @@ install_app_linux() {
   libdir="$(kendex_data)"
   message app-download "$appimage_arch" "Downloading the desktop app."
   if ! curl -fSL --proto '=https' -o "$work/kendex.AppImage" \
-      "$base/kendex_${plain}_${appimage_arch}.AppImage"; then
+      "$app_url"; then
     message app-download-failed "$appimage_arch" "The desktop app could not be downloaded; the kendex command is installed." >&2
     return 0
   fi
@@ -237,7 +297,7 @@ install_app_linux() {
   # Every size the app ships, each in its own slot: a launcher or dock that
   # picks the 128px icon for a HiDPI slot has to upscale it, and the result
   # looks soft.
-  local icons="https://raw.githubusercontent.com/$repo/$version/crates/app/icons"
+  local icons="https://raw.githubusercontent.com/$repo/$icon_ref/crates/app/icons"
   local theme="$data/icons/hicolor"
   install_icon "$theme/32x32/apps" "$icons/32x32.png"
   install_icon "$theme/128x128/apps" "$icons/128x128.png"

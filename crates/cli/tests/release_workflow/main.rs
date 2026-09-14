@@ -1,5 +1,6 @@
-//! release.yml runs only on tags, so its build, staging and manifest steps
-//! are never exercised by a pull request. Both build commands must emit
+//! release.yml runs only on tags and main pushes, so its build, staging and
+//! manifest steps are never exercised by a pull request. Both build
+//! commands must emit
 //! into the per-target output dir and the staging step must read from that
 //! same dir, keyed by the one matrix expression rather than a literal
 //! triple. Staging and the manifest are one contract in two halves, and a
@@ -392,7 +393,9 @@ fn run_manifest(files: &BTreeMap<String, String>) -> (i32, String, String) {
         fs::write(dist.join(name), body).unwrap();
     }
     let workflow = workflow();
-    let script = run_script(&step(&workflow, "name: Write the signed update manifest"));
+    let script = run_script(&step(&workflow, "name: Write the signed update manifest"))
+        .replace("${{ steps.tag.outputs.release-ref }}", "v5.1.0")
+        .replace("${{ steps.tag.outputs.version }}", "5.1.0");
     let run = std::process::Command::new("bash")
         .arg("-c")
         .arg(&script)
@@ -470,12 +473,22 @@ fn the_urls_core_builds_are_the_artifact_the_release_signs_and_its_signature() {
             .map(|(_, file)| file.as_str())
             .unwrap_or_default();
         assert_eq!(
-            kendex_core::update_feed::app_image_url("5.1.0", target).unwrap_or_default(),
+            kendex_core::update_feed::app_image_url(
+                kendex_core::update_channel::UpdateChannel::Release,
+                "5.1.0",
+                target,
+            )
+            .unwrap_or_default(),
             Some(format!("{base}/{artifact}")),
             "{platform}"
         );
         assert_eq!(
-            kendex_core::update_feed::app_image_signature_url("5.1.0", target).unwrap_or_default(),
+            kendex_core::update_feed::app_image_signature_url(
+                kendex_core::update_channel::UpdateChannel::Release,
+                "5.1.0",
+                target,
+            )
+            .unwrap_or_default(),
             Some(format!("{base}/{artifact}.sig")),
             "{platform}"
         );
@@ -665,5 +678,4 @@ fn no_lane_triple_is_hardcoded_into_build_or_staging() {
 
 mod channel;
 mod channel_point;
-mod channel_point_failure;
 mod signing;

@@ -4,8 +4,9 @@
 # button installs from, and the signed digests document each lane publishes
 # about what it built.
 #
-# Tag push only: a release bundle is the most expensive job in the repo,
-# and pull requests are covered by the per-crate checks. No build cache:
+# Tag pushes publish releases. A push to main publishes one immutable build,
+# then changes the fixed channel's single feed pointer.
+# Pull requests are covered by the per-crate checks. No build cache:
 # the only release-profile cache main saves (catalog-check's x86_64
 # kendex-cli build) is keyed to that job and built without --target, so no
 # lane here could restore it; a cache step would only pay for saves that
@@ -19,6 +20,7 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 permissions:
@@ -26,6 +28,9 @@ permissions:
 
 jobs:
   build:
+    concurrency:
+      group: release-build-${{ github.ref }}-${{ matrix.target }}
+      cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -50,6 +55,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Record the main build commit
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "KENDEX_GIT_COMMIT=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "KENDEX_MAIN_BUILD=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+        shell: bash
       - name: Linux webview dependencies
         if: runner.os == 'Linux'
         run: |
@@ -153,7 +164,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          tools/release-digests "${{ matrix.target }}" "${GITHUB_REF_NAME#v}" dist
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            ext=""
+            [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+            built=$("dist/kendex-${{ matrix.target }}${ext}" --version)
+            version=${built##* }
+          fi
+          tools/release-digests "${{ matrix.target }}" "$version" dist
       - uses: actions/upload-artifact@v4
         with:
           name: assets-${{ matrix.target }}
@@ -163,10 +181,16 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
-    # The channel job reads this tag's kind and version through these outputs.
+    name: ${{ github.ref == 'refs/heads/main' && 'main' || 'publish' }}
+    concurrency:
+      group: release-publish-${{ github.run_id }}
+      cancel-in-progress: false
+    # The channel job reads a candidate tag's kind and version through these outputs.
     outputs:
       prerelease: ${{ steps.tag.outputs.prerelease }}
       version: ${{ steps.tag.outputs.version }}
+      channel: ${{ steps.tag.outputs.channel }}
+      main-build: ${{ steps.tag.outputs.main-build }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -200,7 +224,24 @@ jobs:
           fi
           built=${built##* }
           version="${GITHUB_REF_NAME#v}"
-          if [ "$version" != "$built" ]; then
+          release_ref="$GITHUB_REF_NAME"
+          release_name="$GITHUB_REF_NAME"
+          commit=""
+          channel=""
+          main_build=""
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            version="$built"
+            commit="$GITHUB_SHA"
+            main_build="$GITHUB_RUN_NUMBER"
+            release_ref="main-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-${commit}"
+            release_name="main build ${GITHUB_RUN_NUMBER}"
+            channel=rolling-main
+            case "$version" in
+              *".main.${GITHUB_RUN_NUMBER}.${commit}") ;;
+              *"+main.${GITHUB_RUN_NUMBER}.${commit}") ;;
+              *) echo "::error::The main build reports ${version}, which does not name build ${GITHUB_RUN_NUMBER} at commit ${commit}."; exit 1 ;;
+            esac
+          elif [ "$version" != "$built" ]; then
             echo "::error::Tag ${GITHUB_REF_NAME} names version ${version}, and this release was built as ${built}. The tag is the version without its leading v; bump the version to match, or re-tag the commit that carries it."
             exit 1
           fi
@@ -212,19 +253,33 @@ jobs:
           # v1.0.0+build-1 a candidate while the build it produces reads
           # itself as a release and follows release URLs, which is the two
           # halves disagreeing about one tag.
-          case "${version%%+*}" in
-            *-*) prerelease=true ;;
-            *) prerelease=false ;;
-          esac
+          if [ -n "$commit" ]; then
+            prerelease=true
+          else
+            case "${version%%+*}" in
+              *-*) prerelease=true; channel=prerelease ;;
+              *) prerelease=false ;;
+            esac
+          fi
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release-ref=$release_ref" >> "$GITHUB_OUTPUT"
+          echo "release-name=$release_name" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "main-build=$main_build" >> "$GITHUB_OUTPUT"
       - name: Write the update feed
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          version="${{ steps.tag.outputs.version }}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.tag.outputs.release-ref }}"
+          commit="${{ steps.tag.outputs.commit }}"
+          commit_field=""
+          [ -z "$commit" ] || commit_field="  \"main_build\": ${{ steps.tag.outputs.main-build }},
+            \"commit\": \"${commit}\","
           cat > dist/feed.json << EOF
           {
             "schema": 1,
+          ${commit_field}
             "version": "${version}",
             "assets": {
               "x86_64-unknown-linux-gnu": "${base}/kendex-x86_64-unknown-linux-gnu",
@@ -236,9 +291,10 @@ jobs:
           }
           EOF
           cat dist/feed.json
-      # The app installs from this manifest, not from feed.json: each entry
-      # pairs a download with the minisign signature the running app checks
-      # before it replaces itself. Every lane is updater-enabled and every
+      # Tagged app installs use this manifest directly. The main feed later
+      # includes it as the fixed channel's single snapshot. Each entry pairs
+      # a download with the minisign signature the running app checks before
+      # it replaces itself. Every lane is updater-enabled and every
       # one is expected to sign, so a platform missing here is a lane that
       # stopped producing or staging its signature. Publishing without it
       # leaves that platform offering an Update its own manifest cannot
@@ -246,7 +302,7 @@ jobs:
       - name: Write the signed update manifest
         shell: bash
         run: |
-          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.tag.outputs.release-ref }}"
           platforms='{}'
           missing=""
           add() {
@@ -274,11 +330,32 @@ jobs:
             exit 1
           fi
           jq -n \
-            --arg version "${GITHUB_REF_NAME#v}" \
+            --arg version "${{ steps.tag.outputs.version }}" \
             --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson platforms "$platforms" \
             '{version: $version, pub_date: $pub_date, platforms: $platforms}' > dist/latest.json
           cat dist/latest.json
+      - name: Bind the channel pointer to immutable downloads
+        shell: bash
+        run: |
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.tag.outputs.release-ref }}"
+          jq --slurpfile latest dist/latest.json \
+            --arg base "$base" \
+            '. + $latest[0] + {
+              apps: {
+                "x86_64-unknown-linux-gnu": $latest[0].platforms["linux-x86_64"].url,
+                "aarch64-unknown-linux-gnu": $latest[0].platforms["linux-aarch64"].url
+              },
+              digests: {
+                "x86_64-unknown-linux-gnu": ($base + "/digests-x86_64-unknown-linux-gnu.json"),
+                "aarch64-unknown-linux-gnu": ($base + "/digests-aarch64-unknown-linux-gnu.json"),
+                "aarch64-apple-darwin": ($base + "/digests-aarch64-apple-darwin.json"),
+                "x86_64-apple-darwin": ($base + "/digests-x86_64-apple-darwin.json"),
+                "x86_64-pc-windows-msvc": ($base + "/digests-x86_64-pc-windows-msvc.json")
+              }
+            }' dist/feed.json > dist/feed.complete.json
+          mv dist/feed.complete.json dist/feed.json
+          cat dist/feed.json
       # A full release lands as a draft to review before publishing makes it
       # "latest" (docs/RELEASING.md). A pre-release cannot: its assets are
       # unreachable while it is a draft, so nothing could install it, and
@@ -288,33 +365,27 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          tag_name: ${{ steps.tag.outputs.release-ref }}
+          name: ${{ steps.tag.outputs.release-name }}
+          target_commitish: ${{ github.sha }}
           draft: ${{ steps.tag.outputs.prerelease == 'false' }}
           prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}
-      # The channel job writes these onto the fixed pre-release release. The
-      # Linux CLI travels with them and is not published: it is what the
-      # channel job's guard runs `version-compare` on, so the channel is
-      # ordered by the parser every candidate reads its feed with rather
-      # than by a second opinion about SemVer.
+          make_latest: ${{ github.ref == 'refs/heads/main' && 'false' || 'legacy' }}
+      # The channel job writes only feed.json onto the fixed release. The
+      # Linux CLI authenticates a main pointer and orders candidate versions.
       - uses: actions/upload-artifact@v4
         with:
           name: manifests
           path: |
-            dist/latest.json
             dist/feed.json
             dist/digests-*
             dist/kendex-x86_64-unknown-linux-gnu
           if-no-files-found: error
 
-  # Because "latest" skips pre-releases, a candidate has no way to reach the
-  # next one. This release is that way: one fixed tag whose manifests and
-  # digests documents are overwritten by each candidate, which is the URL
-  # `update_channel::feed_url_for` sends a candidate to. They name their
-  # downloads by the tag that built them, so what they point at is that tag's
-  # own release, published by the job above.
+  # Because "latest" skips pre-releases, a candidate and a main build each
+  # need one fixed discovery URL. This job owns that single feed pointer.
   #
-  # That one mutable pointer is what the concurrency group is for: two runs
-  # interleaving their reads and writes of it would leave the older manifests
-  # in place. The group holds this job and nothing else, because it is not a
+  # The concurrency group holds this job and nothing else, because it is not a
   # queue — GitHub keeps one pending run per group and replaces that pending
   # run when another arrives (.github/workflows/review-gate-writer.yml records
   # the same). Inside the group, a burst keeps the first arrival and the last
@@ -323,10 +394,10 @@ jobs:
   # moves the channel to it, which is what docs/RELEASING.md records.
   channel:
     needs: publish
-    if: needs.publish.outputs.prerelease == 'true'
+    if: needs.publish.outputs.channel != ''
     runs-on: ubuntu-24.04
     concurrency:
-      group: release-channel
+      group: release-channel-${{ needs.publish.outputs.channel }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -334,10 +405,11 @@ jobs:
         with:
           name: manifests
           path: dist
-      - name: Point the pre-release channel at this tag
+      - name: Point the rolling channel at this build
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          CHANNEL: prerelease
+          CHANNEL: ${{ needs.publish.outputs.channel }}
           NEW_VERSION: ${{ needs.publish.outputs.version }}
+          NEW_BUILD: ${{ needs.publish.outputs.main-build }}
         run: tools/release-channel-point

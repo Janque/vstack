@@ -72,6 +72,19 @@ fn run_install_in(
     path_ahead: &[&str],
     sudo: &str,
 ) -> (std::process::Output, String) {
+    run_install_in_args(os, arch, fail, home, path_ahead, sudo, &[])
+}
+
+#[allow(clippy::unwrap_used)]
+fn run_install_in_args(
+    os: &str,
+    arch: &str,
+    fail: Option<(&str, i32)>,
+    home: &Path,
+    path_ahead: &[&str],
+    sudo: &str,
+    args: &[&str],
+) -> (std::process::Output, String) {
     let fake = home.join("fake-bin");
     let bindir = home.join(".local/bin");
     fs::create_dir_all(&fake).unwrap();
@@ -94,13 +107,30 @@ fn run_install_in(
         &format!(
             "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=\"$2\"; shift 2 ;; *) url=\"$1\"; shift ;; esac; done\n\
              echo \"$url\" >> \"{log}\"\n{miss}\
-             if [ -n \"$out\" ]; then printf '#!/bin/sh\\necho v9\\n' > \"$out\"; else echo '\"tag_name\": \"v9.9.9\"'; fi\n",
+             case \"$url\" in\n\
+               */rolling-main/feed.json)\n\
+                 printf '%s\\n' '{{' \
+                   '  \"version\": \"5.0.1+main.42.0123456789abcdef0123456789abcdef01234567\",' \
+                   '  \"commit\": \"0123456789abcdef0123456789abcdef01234567\",' \
+                   '  \"assets\": {{' \
+                   '    \"x86_64-unknown-linux-gnu\": \"https://example.test/main-build-42/kendex-x86_64-unknown-linux-gnu\",' \
+                   '    \"aarch64-unknown-linux-gnu\": \"https://example.test/main-build-42/kendex-aarch64-unknown-linux-gnu\",' \
+                   '    \"aarch64-apple-darwin\": \"https://example.test/main-build-42/kendex-aarch64-apple-darwin\",' \
+                   '    \"x86_64-apple-darwin\": \"https://example.test/main-build-42/kendex-x86_64-apple-darwin\"' \
+                   '  }},' \
+                   '  \"apps\": {{' \
+                   '    \"x86_64-unknown-linux-gnu\": \"https://example.test/main-build-42/kendex_5.0.1_amd64.AppImage\",' \
+                   '    \"aarch64-unknown-linux-gnu\": \"https://example.test/main-build-42/kendex_5.0.1_aarch64.AppImage\"' \
+                   '  }}' '}}' > \"$out\" ;;\n\
+               *) if [ -n \"$out\" ]; then printf '#!/bin/sh\\necho v9\\n' > \"$out\"; else echo '\"tag_name\": \"v9.9.9\"'; fi ;;\n\
+             esac\n",
             log = home.join("urls.txt").display()
         ),
     );
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
     let output = Command::new("bash")
         .arg(script)
+        .args(args)
         .env_clear()
         .envs(test_util::fixture_env(home))
         .env(
@@ -154,6 +184,39 @@ fn linux_picks_the_appimage_built_for_its_architecture() {
     assert!(urls.contains("/kendex_9.9.9_aarch64.AppImage"), "{urls}");
     let urls = requested_urls("Darwin", "x86_64");
     assert!(!urls.contains(".AppImage"), "{urls}");
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn git_channel_resolves_one_immutable_main_build() {
+    let home = tempfile::tempdir().unwrap();
+    let root = rooted(&home);
+    let (output, urls) =
+        run_install_in_args("Linux", "x86_64", None, &root, &[], SUDO_STUB, &["--git"]);
+    assert!(
+        output.status.success(),
+        "install.sh --git failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        urls.contains("/releases/download/rolling-main/feed.json"),
+        "{urls}"
+    );
+    assert!(
+        urls.contains("https://example.test/main-build-42/kendex-x86_64-unknown-linux-gnu"),
+        "{urls}"
+    );
+    assert!(
+        urls.contains("https://example.test/main-build-42/kendex_5.0.1_amd64.AppImage"),
+        "{urls}"
+    );
+    assert_eq!(urls.matches("/rolling-main/feed.json").count(), 1, "{urls}");
+    assert!(!urls.contains("/releases/latest"), "{urls}");
+    let record = kendex_core::env::Env::host_rooted(&root).installed_command_file();
+    assert_eq!(
+        fs::read_to_string(record).unwrap(),
+        format!("{}/.local/bin/kendex\nmain\n", root.display())
+    );
 }
 
 /// The matrix lanes and the feed.json keys are two lists in release.yml;
@@ -243,6 +306,12 @@ fn installer_options_report_a_stable_key_and_value() {
             2,
             "unknown-option",
             "--unknown\\ninstall.sh: command-installed=/forged",
+        ),
+        (
+            &["--git", "--version", "v9.9.9"][..],
+            2,
+            "conflicting-options",
+            "--git --version",
         ),
         (&["--help"][..], 0, "usage", "install.sh"),
     ] {

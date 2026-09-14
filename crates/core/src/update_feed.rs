@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::release_digests::MAX_TARGET_BYTES;
+use crate::update_channel::{UpdateChannel, main_version_identity};
 
 mod version;
 use version::parse_version;
@@ -34,7 +35,17 @@ pub struct ReleaseFeed {
     #[serde(default = "default_feed_schema")]
     pub schema: u32,
     pub version: String,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub main_build: Option<u64>,
     pub assets: BTreeMap<String, String>,
+    /// Desktop app downloads keyed by the Rust target used for the command.
+    #[serde(default)]
+    pub apps: BTreeMap<String, String>,
+    /// Signed release descriptors keyed by the Rust target they cover.
+    #[serde(default)]
+    pub digests: BTreeMap<String, String>,
 }
 
 fn default_feed_schema() -> u32 {
@@ -57,13 +68,63 @@ impl ReleaseFeed {
         Ok(feed)
     }
 
-    pub fn relation_to(&self, current: &str) -> Result<VersionRelation> {
+    pub fn for_channel(bytes: &[u8], channel: UpdateChannel) -> Result<Self> {
+        let feed = Self::parse(bytes)?;
+        match (
+            channel,
+            main_version_identity(&feed.version),
+            feed.main_build,
+            feed.commit.as_deref(),
+        ) {
+            (UpdateChannel::Main, Some(identity), Some(build), Some(commit))
+                if identity.build == build && identity.commit == commit =>
+            {
+                Ok(feed)
+            }
+            (UpdateChannel::Main, _, _, _) => {
+                malformed("the main feed identity does not match its version".to_owned())
+            }
+            (UpdateChannel::Release | UpdateChannel::Prerelease, None, None, None) => Ok(feed),
+            (UpdateChannel::Release | UpdateChannel::Prerelease, _, _, _) => {
+                malformed("a release or candidate feed cannot supply a main identity".to_owned())
+            }
+        }
+    }
+
+    pub fn relation_to(&self, current: &str, channel: UpdateChannel) -> Result<VersionRelation> {
+        if channel == UpdateChannel::Main {
+            let offered = main_version_identity(&self.version).ok_or_else(|| {
+                CoreError::UpdateFeedMalformed {
+                    why: "the main channel version carries no main identity".to_owned(),
+                }
+            })?;
+            return Ok(match main_version_identity(current) {
+                Some(running) => match offered.build.cmp(&running.build) {
+                    std::cmp::Ordering::Less => VersionRelation::Older,
+                    std::cmp::Ordering::Equal => VersionRelation::Current,
+                    std::cmp::Ordering::Greater => VersionRelation::Newer,
+                },
+                None => VersionRelation::Newer,
+            });
+        }
         precedence("feed", &self.version, "running build", current)
             .map_err(|why| CoreError::UpdateFeedMalformed { why })
     }
 
     pub fn asset_for(&self, target: &str) -> Option<&str> {
         self.assets.get(target).map(String::as_str)
+    }
+
+    pub fn app_for(&self, target: &str) -> Option<&str> {
+        self.apps.get(target).map(String::as_str)
+    }
+
+    pub fn digests_for(&self, target: &str) -> Option<&str> {
+        self.digests.get(target).map(String::as_str)
+    }
+
+    pub fn release_notes_url(&self, channel: UpdateChannel) -> Result<String> {
+        channel.release_notes_url(&self.version)
     }
 
     fn validate(&self) -> Result<()> {
@@ -80,33 +141,54 @@ impl ReleaseFeed {
             ));
         }
         parse_version("feed", &self.version)?;
-        if self.assets.len() > MAX_ASSETS {
-            return malformed(format!(
-                "assets has {} entries; the limit is {MAX_ASSETS}",
-                self.assets.len()
-            ));
+        if self.commit.is_some() || self.main_build.is_some() {
+            let Some(identity) = main_version_identity(&self.version) else {
+                return malformed("the feed identity has no main version".to_owned());
+            };
+            if self.commit.as_deref() != Some(identity.commit)
+                || self.main_build != Some(identity.build)
+            {
+                return malformed("the feed identity does not match the main version".to_owned());
+            }
         }
-        for (target, url) in &self.assets {
-            if target.is_empty() || target.len() > MAX_TARGET_BYTES {
-                return malformed(format!(
-                    "an asset target has {} bytes; the range is 1..={MAX_TARGET_BYTES}",
-                    target.len()
-                ));
-            }
-            if url.is_empty() || url.len() > MAX_URL_BYTES {
-                return malformed(format!(
-                    "asset '{target}' has a URL of {} bytes; the range is 1..={MAX_URL_BYTES}",
-                    url.len()
-                ));
-            }
-            if !url.starts_with("https://") && !url.starts_with("file://") {
-                return malformed(format!(
-                    "asset '{target}' URL must start with https:// or file://"
-                ));
-            }
+        for (name, assets) in [
+            ("assets", &self.assets),
+            ("apps", &self.apps),
+            ("digests", &self.digests),
+        ] {
+            validate_assets(name, assets)?;
         }
         Ok(())
     }
+}
+
+fn validate_assets(name: &str, assets: &BTreeMap<String, String>) -> Result<()> {
+    if assets.len() > MAX_ASSETS {
+        return malformed(format!(
+            "{name} has {} entries; the limit is {MAX_ASSETS}",
+            assets.len()
+        ));
+    }
+    for (target, url) in assets {
+        if target.is_empty() || target.len() > MAX_TARGET_BYTES {
+            return malformed(format!(
+                "a {name} target has {} bytes; the range is 1..={MAX_TARGET_BYTES}",
+                target.len()
+            ));
+        }
+        if url.is_empty() || url.len() > MAX_URL_BYTES {
+            return malformed(format!(
+                "{name} '{target}' has a URL of {} bytes; the range is 1..={MAX_URL_BYTES}",
+                url.len()
+            ));
+        }
+        if !url.starts_with("https://") && !url.starts_with("file://") {
+            return malformed(format!(
+                "{name} '{target}' URL must start with https:// or file://"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn release_notes_url(version: &str) -> Result<String> {
@@ -120,7 +202,11 @@ pub fn release_notes_url(version: &str) -> Result<String> {
 /// `install.sh` names it. Both halves come from values this build owns: a
 /// version that parsed as SemVer, and a target triple the release builds.
 /// Targets without an AppImage have none.
-pub fn app_image_url(version: &str, target: &str) -> Result<Option<String>> {
+pub fn app_image_url(
+    channel: UpdateChannel,
+    version: &str,
+    target: &str,
+) -> Result<Option<String>> {
     parse_version("feed", version)?;
     // Tauri names AppImages with Debian arch words, not the Rust triple.
     let arch = match target {
@@ -128,8 +214,17 @@ pub fn app_image_url(version: &str, target: &str) -> Result<Option<String>> {
         "aarch64-unknown-linux-gnu" => "aarch64",
         _ => return Ok(None),
     };
+    let (release, file) = match channel {
+        // A rolling app URL comes from the one feed snapshot. Rebuilding it
+        // from the mutable channel name can select another generation.
+        UpdateChannel::Main => return Ok(None),
+        UpdateChannel::Release | UpdateChannel::Prerelease => (
+            format!("v{version}"),
+            format!("kendex_{version}_{arch}.AppImage"),
+        ),
+    };
     Ok(Some(format!(
-        "https://github.com/vanillagreencom/kendex/releases/download/v{version}/kendex_{version}_{arch}.AppImage"
+        "https://github.com/vanillagreencom/kendex/releases/download/{release}/{file}"
     )))
 }
 
@@ -141,8 +236,12 @@ pub fn signature_url(artifact_url: &str) -> String {
 }
 
 /// The signature published beside that AppImage.
-pub fn app_image_signature_url(version: &str, target: &str) -> Result<Option<String>> {
-    Ok(app_image_url(version, target)?.map(|url| signature_url(&url)))
+pub fn app_image_signature_url(
+    channel: UpdateChannel,
+    version: &str,
+    target: &str,
+) -> Result<Option<String>> {
+    Ok(app_image_url(channel, version, target)?.map(|url| signature_url(&url)))
 }
 
 /// Refuse a download that `signature` does not cover under
@@ -196,7 +295,11 @@ mod tests {
         let body = serde_json::to_vec(&ReleaseFeed {
             schema: FEED_SCHEMA,
             version: "5.1.0".to_owned(),
+            commit: None,
+            main_build: None,
             assets,
+            apps: BTreeMap::new(),
+            digests: BTreeMap::new(),
         })
         .unwrap();
         ReleaseFeed::parse(&body)
@@ -275,7 +378,7 @@ mod tests {
             assert_eq!(
                 ReleaseFeed::parse(&feed(published))
                     .unwrap()
-                    .relation_to(running)
+                    .relation_to(running, UpdateChannel::Release)
                     .unwrap(),
                 relation,
                 "feed {published} against a running {running}"
@@ -284,22 +387,72 @@ mod tests {
         assert!(
             ReleaseFeed::parse(&feed("5.9.0"))
                 .unwrap()
-                .relation_to("not a version")
+                .relation_to("not a version", UpdateChannel::Release)
                 .is_err()
         );
     }
 
     #[test]
+    fn a_main_feed_compares_and_records_its_commit() {
+        let old = "0123456789abcdef0123456789abcdef01234567";
+        let new = "89abcdef0123456789abcdef0123456789abcdef";
+        let body = format!(
+            r#"{{"schema":1,"version":"5.0.1+main.12.{new}","main_build":12,"commit":"{new}","assets":{{}}}}"#
+        );
+        let feed = ReleaseFeed::for_channel(body.as_bytes(), UpdateChannel::Main).unwrap();
+        assert_eq!(feed.commit.as_deref(), Some(new));
+        assert_eq!(
+            feed.relation_to(&format!("5.0.1+main.11.{old}"), UpdateChannel::Main)
+                .unwrap(),
+            VersionRelation::Newer
+        );
+        assert_eq!(
+            feed.relation_to(&format!("5.0.1+main.12.{new}"), UpdateChannel::Main)
+                .unwrap(),
+            VersionRelation::Current
+        );
+        assert_eq!(
+            feed.release_notes_url(UpdateChannel::Main).unwrap(),
+            "https://github.com/vanillagreencom/kendex/releases/tag/rolling-main"
+        );
+
+        let mismatched = format!(
+            r#"{{"schema":1,"version":"5.0.1+main.12.{new}","main_build":12,"commit":"{old}","assets":{{}}}}"#
+        );
+        assert!(ReleaseFeed::parse(mismatched.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn only_the_main_channel_accepts_a_main_identity() {
+        let commit = "89abcdef0123456789abcdef0123456789abcdef";
+        let body = format!(
+            r#"{{"schema":1,"version":"5.0.1+main.12.{commit}","main_build":12,"commit":"{commit}","assets":{{}}}}"#
+        );
+        assert!(ReleaseFeed::for_channel(body.as_bytes(), UpdateChannel::Main).is_ok());
+        assert!(ReleaseFeed::for_channel(body.as_bytes(), UpdateChannel::Release).is_err());
+        assert!(ReleaseFeed::for_channel(body.as_bytes(), UpdateChannel::Prerelease).is_err());
+
+        let release = br#"{"schema":1,"version":"5.1.0","main_build":12,"commit":"89abcdef0123456789abcdef0123456789abcdef","assets":{}}"#;
+        assert!(ReleaseFeed::for_channel(release, UpdateChannel::Release).is_err());
+    }
+
+    #[test]
     fn the_signature_url_is_the_app_image_url_with_the_published_suffix() {
         assert_eq!(
-            app_image_signature_url("5.1.0", "x86_64-unknown-linux-gnu").unwrap(),
+            app_image_signature_url(
+                UpdateChannel::Release,
+                "5.1.0",
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap(),
             Some(
                 "https://github.com/vanillagreencom/kendex/releases/download/v5.1.0/kendex_5.1.0_amd64.AppImage.sig"
                     .to_owned()
             )
         );
         assert_eq!(
-            app_image_signature_url("5.1.0", "aarch64-apple-darwin").unwrap(),
+            app_image_signature_url(UpdateChannel::Release, "5.1.0", "aarch64-apple-darwin")
+                .unwrap(),
             None
         );
         // The command binary the feed names finds its own by the same rule.
@@ -309,17 +462,29 @@ mod tests {
     #[test]
     fn the_app_image_url_is_built_only_from_a_semver_version_and_a_known_target() {
         assert_eq!(
-            app_image_url("5.1.0", "x86_64-unknown-linux-gnu").unwrap(),
+            app_image_url(
+                UpdateChannel::Release,
+                "5.1.0",
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap(),
             Some(
                 "https://github.com/vanillagreencom/kendex/releases/download/v5.1.0/kendex_5.1.0_amd64.AppImage"
                     .to_owned()
             )
         );
         assert_eq!(
-            app_image_url("5.1.0", "aarch64-apple-darwin").unwrap(),
+            app_image_url(UpdateChannel::Release, "5.1.0", "aarch64-apple-darwin").unwrap(),
             None
         );
-        assert!(app_image_url("5.1.0 ; rm -rf /", "x86_64-unknown-linux-gnu").is_err());
+        assert!(
+            app_image_url(
+                UpdateChannel::Release,
+                "5.1.0 ; rm -rf /",
+                "x86_64-unknown-linux-gnu",
+            )
+            .is_err()
+        );
     }
 
     #[test]

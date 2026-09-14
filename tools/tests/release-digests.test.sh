@@ -13,8 +13,9 @@
 #        that stopped some other way — or one a dependency spoke over — cannot
 #        render as one that stopped for the row's reason
 #   doc  the document DIST/digests-TARGET.json: `absent`, or its fields as
-#        `schema=<n> version=<v> target=<t> command=<hex> app=<hex>` read
-#        through jq, or `unparsed:<text>` when jq cannot read it
+#        `schema=<n> version=<v> target=<t> [main_build=<n> commit=<sha>]
+#        command=<hex> app=<hex>` read through jq, or `unparsed:<text>` when
+#        jq cannot read it
 #
 # The refusals table is `label|world|target|version|rc|first|document`:
 #   world     what the Linux x86_64 lane staged, as words `build` maps onto
@@ -26,6 +27,15 @@
 #             is not pinned.
 #   document  `absent`: a lane that half-wrote a document would publish a
 #             statement it never measured, so every refusal row checks it.
+#
+# The main identity refusal table is `label|build|commit|version|first`:
+#   build      KENDEX_MAIN_BUILD, or `-` when it is absent
+#   commit     KENDEX_GIT_COMMIT, or `-` when it is absent
+#   first      the `main-identity=<value>` refusal the row must open with
+# Every row asserts exit 1 and an absent digest document.
+#
+# The main identity success table is `label|version`. Each row uses the
+# same valid build and commit, then holds every signed document field.
 #
 # The lanes table is `label|target|staged|command file|app file`:
 #   staged        the files the lane's staging step left in DIST, each
@@ -122,7 +132,7 @@ doc_text() { # TARGET — the document's fields, `absent`, or `unparsed:<text>`
   [[ -e "$doc" ]] || { printf 'absent'; return; }
   # schema keeps its JSON type: a client reads it as a number, so a quoted
   # "1" renders with its quotes and reddens the row.
-  if fields="$(jq -r '"schema=\(.schema|tojson) version=\(.version) target=\(.target) command=\(.command) app=\(.app)"' "$doc" 2>/dev/null)"; then
+  if fields="$(jq -r '"schema=\(.schema|tojson) version=\(.version) target=\(.target)\(if has("main_build") then " main_build=\(.main_build) commit=\(.commit)" else "" end) command=\(.command) app=\(.app)"' "$doc" 2>/dev/null)"; then
     printf '%s' "$fields"
   else
     printf 'unparsed:%s' "$(paste -s -d ';' - <"$doc")"
@@ -131,7 +141,18 @@ doc_text() { # TARGET — the document's fields, `absent`, or `unparsed:<text>`
 
 run() { # TARGET VERSION
   local rc=0
-  "$DIGESTS" --document-only "$1" "$2" "$DIST" >"$TMP/out" 2>&1 || rc=$?
+  env -u KENDEX_MAIN_BUILD -u KENDEX_GIT_COMMIT \
+    "$DIGESTS" --document-only "$1" "$2" "$DIST" >"$TMP/out" 2>&1 || rc=$?
+  printf 'rc=%s out=%s doc=%s' "$rc" "$(out_text)" "$(doc_text "$1")"
+}
+
+run_with_main_identity() { # TARGET VERSION BUILD|- COMMIT|-
+  local rc=0 build="$3" commit="$4"
+  local -a identity=()
+  [[ "$build" == "-" ]] || identity+=("KENDEX_MAIN_BUILD=$build")
+  [[ "$commit" == "-" ]] || identity+=("KENDEX_GIT_COMMIT=$commit")
+  env -u KENDEX_MAIN_BUILD -u KENDEX_GIT_COMMIT "${identity[@]}" \
+    "$DIGESTS" --document-only "$1" "$2" "$DIST" >"$TMP/out" 2>&1 || rc=$?
   printf 'rc=%s out=%s doc=%s' "$rc" "$(out_text)" "$(doc_text "$1")"
 }
 
@@ -170,6 +191,38 @@ run_refusals() {
   asserted "$before"
 }
 
+run_main_identity_refusals() {
+  local rows="$1" label build commit version first got row before=$((PASS + FAIL))
+  echo "=== rolling builds refuse incomplete or invalid identities ==="
+  while IFS= read -r row; do
+    [[ "$row" != "" ]] || continue
+    IFS='|' read -r label build commit version first <<<"$row"
+    fields_present "$row" "$label" "$build" "$commit" "$version" "$first"
+    stage kendex-x86_64-unknown-linux-gnu "kendex_${VERSION}_amd64.AppImage"
+    got="$(run_with_main_identity x86_64-unknown-linux-gnu "$version" "$build" "$commit")"
+    probe "$label" "$got" && continue
+    assert_eq "$got" "rc=1 out=$first doc=absent" "$label"
+  done <<<"$rows"
+  asserted "$before"
+}
+
+run_main_identity_successes() {
+  local rows="$1" label version got row before=$((PASS + FAIL))
+  local target=x86_64-unknown-linux-gnu command_file="kendex-x86_64-unknown-linux-gnu"
+  local app_file="kendex_${VERSION}_amd64.AppImage"
+  echo "=== rolling build forms reach a complete digest document ==="
+  while IFS= read -r row; do
+    [[ "$row" != "" ]] || continue
+    IFS='|' read -r label version <<<"$row"
+    fields_present "$row" "$label" "$version"
+    stage "$command_file" "$app_file"
+    got="$(run_with_main_identity "$target" "$version" 42 "$MAIN_COMMIT")"
+    probe "$label" "$got" && continue
+    assert_eq "$got" "rc=0 out=- doc=schema=1 version=$version target=$target main_build=42 commit=$MAIN_COMMIT command=$(sha256 "$DIST/$command_file") app=$(sha256 "$DIST/$app_file")" "$label"
+  done <<<"$rows"
+  asserted "$before"
+}
+
 run_lanes() {
   local title="$1" rows="$2" label target staged command_file app_file got row before=$((PASS + FAIL))
   echo "=== $title ==="
@@ -195,6 +248,19 @@ a lane missing its app download is refused|command sig|x86_64-unknown-linux-gnu|
 two app downloads in one lane are refused rather than picked between|command app app2 sig|x86_64-unknown-linux-gnu|9.9.9|1|ambiguous=kendex_*_amd64.AppImage|absent
 "
 
+MAIN_COMMIT=0123456789abcdef0123456789abcdef01234567
+run_main_identity_refusals "\
+a build without a commit is refused|42|-|9.9.9|main-identity=
+a commit without a build is refused|-|$MAIN_COMMIT|9.9.9|main-identity=
+a nonnumeric build is refused|forty-two|$MAIN_COMMIT|9.9.9|main-identity=forty-two
+a malformed commit is refused|42|not-a-commit|9.9.9|main-identity=not-a-commit
+"
+
+run_main_identity_successes "\
+a workspace version with no prior metadata is accepted|9.9.9+main.42.$MAIN_COMMIT
+a package version with existing metadata is accepted|9.9.9+vendor.7.main.42.$MAIN_COMMIT
+"
+
 run_lanes "the lanes, each measuring the two downloads its updater installs" "\
 the Linux lane measures the command and the AppImage, not the deb or the signature|x86_64-unknown-linux-gnu|kendex-x86_64-unknown-linux-gnu kendex_9.9.9_amd64.AppImage kendex_9.9.9_amd64.AppImage.sig kendex_9.9.9_amd64.deb|kendex-x86_64-unknown-linux-gnu|kendex_9.9.9_amd64.AppImage
 the Windows lane measures the .exe command and the installer|x86_64-pc-windows-msvc|kendex-x86_64-pc-windows-msvc.exe kendex_9.9.9_x64-setup.exe kendex_9.9.9_x64-setup.exe.sig|kendex-x86_64-pc-windows-msvc.exe|kendex_9.9.9_x64-setup.exe
@@ -216,7 +282,8 @@ signer_case() { # LABEL STUB-BODY WANT-KEY WANT-SENTINEL
   printf '%s\n' '#!/bin/sh' "$2" >"$SIGNER_ROOT/ui/node_modules/.bin/tauri"
   chmod +x "$SIGNER_ROOT/ui/node_modules/.bin/tauri"
   stage kendex-x86_64-unknown-linux-gnu "kendex_${VERSION}_amd64.AppImage"
-  out="$("$SIGNER_ROOT/tools/release-digests" x86_64-unknown-linux-gnu "$VERSION" "$DIST" 2>&1)" || rc=$?
+  out="$(env -u KENDEX_MAIN_BUILD -u KENDEX_GIT_COMMIT \
+    "$SIGNER_ROOT/tools/release-digests" x86_64-unknown-linux-gnu "$VERSION" "$DIST" 2>&1)" || rc=$?
   first="$(sed -n 1p <<<"$out")"
   local rest
   rest="$(sed -n '2,$p' <<<"$out")"

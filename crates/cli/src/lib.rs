@@ -8,7 +8,6 @@ mod ui;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use kendex_core::command_update::record_first_run;
 use kendex_core::env::Env;
 use kendex_core::install_channel::{Host, HostProbe};
 use kendex_core::legal;
@@ -19,11 +18,7 @@ use flags::{AddFlags, ReportFlags};
 use scope::ScopeFilter;
 
 #[derive(Parser)]
-#[command(
-    name = "kendex",
-    version,
-    about = "Skills, agents, hooks. Cross-harness."
-)]
+#[command(name = "kendex", about = "Skills, agents, hooks. Cross-harness.")]
 struct Cli {
     /// Bare form: `kendex <source> [flags]` maps to `add`.
     source: Option<String>,
@@ -208,6 +203,9 @@ enum Command {
         /// Reinstall even when the version matches
         #[arg(short = 'f', long)]
         force: bool,
+        /// Install and follow the current main branch build
+        #[arg(long)]
+        git: bool,
     },
     /// Where the first version stands against the second under SemVer
     /// precedence: newer, same, or older
@@ -216,6 +214,9 @@ enum Command {
     /// The model id a rank on the tier ladder names on one harness
     #[command(name = "tier-model")]
     TierModel(commands::tier_model::TierModelArgs),
+    /// Verify and print the monotonic identity of a rolling release feed.
+    #[command(name = "release-main-build", hide = true)]
+    ReleaseMainBuild(commands::update::ReleaseMainBuildArgs),
     /// Update Pi extension packages
     #[command(name = "update-pi")]
     UpdatePi {
@@ -244,7 +245,9 @@ pub fn main() -> ExitCode {
         bootstrap_the_command_record(&env);
         announce_the_terms_on_first_run(&env);
     }
-    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let matches = <Cli as clap::CommandFactory>::command()
+        .version(env!("KENDEX_BUILD_VERSION"))
+        .get_matches();
     let cli = match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(error) => error.exit(),
@@ -330,7 +333,11 @@ fn bootstrap_the_command_record(env: &Env) {
     let Ok(running) = std::env::current_exe() else {
         return;
     };
-    let _ = record_first_run(env, &Host.resolve(&running));
+    let _ = kendex_core::command_update::record_first_run_on(
+        env,
+        &Host.resolve(&running),
+        kendex_core::update_channel::UpdateChannel::for_version(env!("KENDEX_BUILD_VERSION")),
+    );
 }
 
 /// The one line a first run says about the terms, and the record it leaves.
@@ -512,9 +519,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Marketplace(command) => commands::marketplace_cmd::run(&env, command)?,
         Command::Index { dir, json } => commands::index_cmd::run(dir, json)?,
         Command::Init { name, kind } => commands::init::run(name, kind)?,
-        Command::Update { force } => commands::update::run(&env, force)?,
+        Command::Update { force, git } => commands::update::run(&env, force, git)?,
         Command::VersionCompare(args) => commands::version_compare::run(args)?,
         Command::TierModel(args) => commands::tier_model::run(args)?,
+        Command::ReleaseMainBuild(args) => commands::update::release_main_build(args)?,
     }
     Ok(ExitCode::SUCCESS)
 }
