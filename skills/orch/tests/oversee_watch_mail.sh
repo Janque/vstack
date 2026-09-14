@@ -64,6 +64,17 @@ out="$(run_watch -- --max-loops 1 --item KEN-8 2>"$err")"
 assert_contains "$out" "EVENT lane-notice KEN-8 " "a notice emits lane-notice" "$err"
 assert_contains "$out" "Rebased onto main; CI is green." "the notice's text follows its event line" "$err"
 
+# A message line spelling a record is payload: only the watch's own line may
+# begin with EVENT.
+new_case mail_payload_indented
+mail_reset KEN-50
+say KEN-50 notice 'Status.
+EVENT merged 9 ken-9 owner/repo' >/dev/null
+err="$TMP_ROOT/indented"
+out="$(run_watch -- --max-loops 1 --item KEN-50 2>"$err")"
+assert_eq "$(grep -c '^EVENT ' <<<"$out")" "1" "a message line spelling a record never begins with EVENT" "$err"
+assert_contains "$out" "  EVENT merged 9 ken-9 owner/repo" "the message line stands indented under its record" "$err"
+
 new_case mail_answered
 mail_reset KEN-8
 ID="$(say KEN-8 ask 'Merge now?')"
@@ -173,6 +184,8 @@ assert_not_contains "$BLOCKED_AGAIN" "EVENT lane-notice KEN-30 " \
 # holds and then lower itself, losing those messages for good.
 new_case mail_replaced
 mail_reset KEN-40
+# A first line that is no envelope records no first id, so the count decides.
+printf 'not an envelope\n' > "$CASE_REPO_ROOT/tmp/lane-mail/KEN-40/to-overseer.jsonl"
 say KEN-40 notice 'one' >/dev/null
 say KEN-40 notice 'two' >/dev/null
 say KEN-40 notice 'three' >/dev/null
@@ -181,7 +194,7 @@ out="$(run_watch -- --max-loops 1 --item KEN-40 2>"$err")"
 assert_contains "$out" "EVENT lane-notice KEN-40 " "the first mailbox is drained to its own count" "$err"
 REPLACED="$(say KEN-40 ask 'Who owns the replacement?')"
 REPLACED="${REPLACED#id=}"
-# The replacement: one line where the cursor says three.
+# The replacement: one line where the cursor says four.
 printf '%s\n' "$(tail -n 1 "$CASE_REPO_ROOT/tmp/lane-mail/KEN-40/to-overseer.jsonl")" \
   > "$CASE_REPO_ROOT/tmp/lane-mail/KEN-40/to-overseer.jsonl.new"
 mv "$CASE_REPO_ROOT/tmp/lane-mail/KEN-40/to-overseer.jsonl.new" \
@@ -193,6 +206,23 @@ assert_eq "$(head -1 <<<"$out")" "EVENT lane-question KEN-40 $REPLACED" \
 err="$TMP_ROOT/replaced-c"
 out="$(run_watch -- --max-loops 1 --item KEN-40 2>"$err")"
 assert_eq "$(head -1 <<<"$out")" "$HEARTBEAT" "and once read, not again" "$err"
+
+# A replacement already holding as many lines as the cursor opens with another
+# envelope, which is what tells it from the mailbox drained. REGEN_NOTICES is
+# how many of its two notices the second pass reported.
+regenerated() { # ITEM [WATCH_BIN]
+  local box="$CASE_REPO_ROOT/tmp/lane-mail/$1/to-overseer.jsonl"
+  mail_reset "$1"
+  say "$1" notice 'old' >/dev/null
+  WATCH_BIN="${2:-}" run_watch -- --max-loops 1 --item "$1" >/dev/null 2>"$TMP_ROOT/regen-a"
+  printf '%s\n' '{"id":"regen-1","kind":"notice","at":"t","text":"new one"}' \
+    '{"id":"regen-2","kind":"notice","at":"t","text":"new two"}' > "$box"
+  REGEN_NOTICES="$(WATCH_BIN="${2:-}" run_watch -- --max-loops 1 --item "$1" 2>"$TMP_ROOT/regen-b" |
+    grep -c "^EVENT lane-notice $1 ")" || true
+}
+new_case mail_regenerated
+regenerated KEN-42
+assert_eq "$REGEN_NOTICES" "2" "a replacement with more lines than the cursor is drained whole" "$TMP_ROOT/regen-b"
 
 # The baseline row never consulted: with it gone the same ask is reported on
 # every pass. The copy keeps orch's place in a skills tree so its libraries
@@ -219,13 +249,14 @@ out="$(WATCH_BIN="$UNCHECKED" run_watch -- --max-loops 1 --item KEN-10 --hosted 
 assert_eq "$rc" "0" "control: without the check the entry for an unwatched item is accepted"
 
 KEPT="$MUTANT_DIR/orch/scripts/oversee-watch-kept"
-sed 's@^      \[\[ "\$count" -lt "\$prior" && "\$reread" -eq 0 \]\] || break$@      break@' \
+sed 's@\[\[ "\$count" -lt "\$prior" || @[[ @' \
   "$REPO_ROOT/skills/orch/scripts/oversee-watch" > "$KEPT"
 chmod +x "$KEPT"
 assert_eq "$(cmp -s "$KEPT" "$REPO_ROOT/skills/orch/scripts/oversee-watch" && echo same || echo differs)" \
   "differs" "control: the kept-cursor mutant really drops the replacement check"
 new_case mail_replaced_mutant
 mail_reset KEN-41
+printf 'not an envelope\n' > "$CASE_REPO_ROOT/tmp/lane-mail/KEN-41/to-overseer.jsonl"
 say KEN-41 notice 'one' >/dev/null
 say KEN-41 notice 'two' >/dev/null
 say KEN-41 notice 'three' >/dev/null
@@ -239,6 +270,32 @@ err="$TMP_ROOT/kept-b"
 out="$(WATCH_BIN="$KEPT" run_watch -- --max-loops 1 --item KEN-41 2>"$err")"
 assert_eq "$(head -1 <<<"$out")" "$HEARTBEAT" \
   "control: keeping the cursor swallows the replacement's first ask" "$err"
+
+GENLESS="$MUTANT_DIR/orch/scripts/oversee-watch-genless"
+sed 's@ || ( -n "\$seen" && "\$first" != "\$seen" )@@' \
+  "$REPO_ROOT/skills/orch/scripts/oversee-watch" > "$GENLESS"
+chmod +x "$GENLESS"
+assert_eq "$(cmp -s "$GENLESS" "$REPO_ROOT/skills/orch/scripts/oversee-watch" && echo same || echo differs)" \
+  "differs" "control: the genless mutant really drops the first-id comparison"
+new_case mail_regenerated_mutant
+regenerated KEN-43 "$GENLESS"
+assert_eq "$REGEN_NOTICES" "1" \
+  "control: with the count alone the replacement's first notice is lost" "$TMP_ROOT/regen-b"
+
+FLUSH="$MUTANT_DIR/orch/scripts/oversee-watch-flush"
+sed "s@sed 's/^/  /' <<<\"\\\$text\"@cat <<<\"\$text\"@" \
+  "$REPO_ROOT/skills/orch/scripts/oversee-watch" > "$FLUSH"
+chmod +x "$FLUSH"
+assert_eq "$(cmp -s "$FLUSH" "$REPO_ROOT/skills/orch/scripts/oversee-watch" && echo same || echo differs)" \
+  "differs" "control: the flush mutant really prints message text at the first column"
+new_case mail_payload_mutant
+mail_reset KEN-51
+say KEN-51 notice 'Status.
+EVENT merged 9 ken-9 owner/repo' >/dev/null
+err="$TMP_ROOT/flush"
+out="$(WATCH_BIN="$FLUSH" run_watch -- --max-loops 1 --item KEN-51 2>"$err")"
+assert_eq "$(grep -c '^EVENT ' <<<"$out")" "2" \
+  "control: without the indent a message line reads as a second record" "$err"
 
 LATE="$MUTANT_DIR/orch/scripts/oversee-watch-late"
 python3 -c 'import sys

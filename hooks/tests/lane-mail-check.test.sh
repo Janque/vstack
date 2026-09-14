@@ -70,6 +70,16 @@ new_lane() { # NAME BRANCH
   ln -s -f -n "$REPO_ROOT/skills/orch/scripts" "$LANE/.agents/skills/orch/scripts"
   ln -s -f -n ../../.agents/skills/orch "$LANE/.claude/skills/orch"
   install_hook "$HOOK" "$LANE/.claude/hooks/lane-mail-check.sh"
+  mark_lane "$2"
+}
+
+# The marker a launcher writes: the lane's root, named for the item in lower
+# case under the common git directory.
+mark_lane() { # ITEM
+  local common
+  common="$(git -C "$LANE" rev-parse --path-format=absolute --git-common-dir)"
+  mkdir -p "$common/lane-mail"
+  git -C "$LANE" rev-parse --show-toplevel > "$common/lane-mail/$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
 }
 
 RC=0
@@ -149,12 +159,80 @@ send KEN-4 'Then re-arm auto-merge.'
 stop
 expect 2 "lane-mail-check: unread=2" "two new messages refuse once, naming both"
 
+# Killed right after its Nth reader call, as a harness kills a hook at its
+# budget, the hook has shown the directive or left it unread, never consumed it
+# unseen. KILLED is shown, kept (the next stop reports it) or lost.
+killed_stop() { # NAME ITEM N [HOOK]
+  local calls="$TMP_ROOT/$1.calls"
+  new_lane "$1" "$(printf '%s' "$2" | tr 'A-Z' 'a-z')"
+  [ -z "${4:-}" ] || install_hook "$4" "$LANE/.claude/hooks/lane-mail-check.sh"
+  send "$2" 'Survive the budget.'
+  rm -f "$LANE/.claude/skills/orch"
+  mkdir -p "$LANE/.claude/skills/orch/scripts"
+  printf '#!/usr/bin/env bash\nrc=0\n"%s" "$@" || rc=$?\nn=$(( $(cat "%s" 2>/dev/null || echo 0) + 1 ))\necho "$n" > "%s"\n[ "$n" -ne %s ] || kill -9 "$PPID"\nexit "$rc"\n' \
+    "$LANE_MAIL" "$calls" "$calls" "$3" > "$LANE/.claude/skills/orch/scripts/lane-mail"
+  chmod +x "$LANE/.claude/skills/orch/scripts/lane-mail"
+  KILLED=lost
+  stop
+  if grep -q '^lane-mail-check: unread=1$' "$ERR_FILE"; then
+    KILLED=shown
+  else
+    stop
+    [ "$(first_line)" != 'lane-mail-check: unread=1' ] || KILLED=kept
+  fi
+}
+for row in 1:kept 2:shown; do
+  killed_stop "killed${row%%:*}" "KEN-1$((6 + ${row%%:*}))" "${row%%:*}"
+  assert_eq "$KILLED" "${row#*:}" "a hook killed after reader call ${row%%:*} loses no directive"
+done
+
+# A launch makes a lane: a mailbox a repository carries with no launch marker,
+# or with one bound to another root, is no lane.
+unlaunched() { # NAME ITEM MARKER-CONTENT [HOOK] — empty content removes the marker
+  new_lane "$1" "$(printf '%s' "$2" | tr 'A-Z' 'a-z')"
+  [ -z "${4:-}" ] || install_hook "$4" "$LANE/.claude/hooks/lane-mail-check.sh"
+  send "$2" 'Pose as a lane.'
+  local marker
+  marker="$LANE/.git/lane-mail/$(printf '%s' "$2" | tr 'A-Z' 'a-z')"
+  rm -f "$marker"
+  [ -z "$3" ] || printf '%s\n' "$3" > "$marker"
+  stop
+}
+unlaunched unmarked KEN-20 ""
+expect 0 - "a mailbox with no launch marker is no lane and passes silently"
+unlaunched rebound KEN-21 "$TMP_ROOT/another-root"
+expect 0 - "a launch marker bound to another root is no lane and passes silently"
+
+# Anything present at to-lane.jsonl in a launched lane reaches the reader,
+# whose component rule refuses it: never passed as a mailbox with no file.
+for row in dir:ken-23 link:ken-24; do
+  new_lane "unsafe_${row%%:*}" "${row#*:}"
+  box="$LANE/tmp/lane-mail/$(printf '%s' "${row#*:}" | tr 'a-z' 'A-Z')"
+  mkdir -p "$box"
+  case "${row%%:*}" in
+    dir) mkdir "$box/to-lane.jsonl" ;;
+    link) ln -s "$TMP_ROOT/nowhere" "$box/to-lane.jsonl" ;;
+  esac
+  stop
+  assert_eq "RC=$RC first=$(first_line) cause=$(grep -c "^lane-mail: mailbox-unsafe=$box/to-lane.jsonl\$" "$ERR_FILE")" \
+    "RC=2 first=lane-mail-check: inbox=2 cause=1" "a ${row%%:*} at to-lane.jsonl in a launched lane is refused, never passed"
+done
+
+# A marker present but not a plain file is refused, never read as no lane.
+new_lane marker_dir ken-25
+send KEN-25 'Behind a marker that is a directory.'
+rm -f "$LANE/.git/lane-mail/ken-25"
+mkdir "$LANE/.git/lane-mail/ken-25"
+stop
+expect 2 "lane-mail-check: marker=$LANE/.git/lane-mail/ken-25" "a marker path that is a directory is refused, never read as no lane"
+
 new_lane answered ken-5
 send KEN-5 'Merge it.' --re some-ask
 stop
 expect 0 - "an answer belongs to the wait that asked for it and never stops a turn"
 
 new_lane named ken-6
+mark_lane OTHER-1
 send OTHER-1 'Brief-named mailbox.'
 stop
 expect 0 - "a mailbox the branch does not name is not read without LANE_MAIL_ITEM"
@@ -254,13 +332,23 @@ mutant() { # NAME SED-ARGUMENT...
     "control: the $name mutant really differs from the hook"
 }
 
-mutant no-block -e 's@^refuse unread "\$COUNT"$@exit 0@'
+mutant no-block -e 's@^message unread "\$COUNT"$@exit 0@'
 BLOCK_MUTANT="$MUTANT_PATH"
 new_lane control ken-11
 send KEN-11 'Block me.'
 install_hook "$BLOCK_MUTANT" "$LANE/.claude/hooks/lane-mail-check.sh"
 stop
 expect 0 - "control: without its refusal the hook lets the turn end with the message unread"
+
+mutant unbound -e 's@^\[ "\$BOUND" = "\$ROOT" \] || exit 0$@:@'
+unlaunched control_unmarked KEN-22 "" "$MUTANT_PATH"
+expect 2 "lane-mail-check: unread=1" "control: without the marker rule a committed mailbox poses as a lane"
+
+# The acknowledgement moved ahead of the refusal, both still made: killed
+# between them, the hook has consumed a directive it never showed.
+mutant ack-first -e '/^message unread "\$COUNT"$/d' -e 's@^exit 2$@message unread "$COUNT"; exit 2@'
+killed_stop control_killed KEN-19 2 "$MUTANT_PATH"
+assert_eq "$KILLED" "lost" "control: acknowledged before its refusal, a killed hook consumes the directive unseen"
 
 # The containment rule's control: its refusal arm replaced by the assignment
 # it guards, so the repository's script runs and leaves its marker.
