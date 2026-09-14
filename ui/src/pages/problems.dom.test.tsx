@@ -9,6 +9,7 @@ import type {
   Scope,
 } from "@/bindings";
 import { commands } from "@/bindings";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ADOPTABLE } from "@/lib/adoptable";
 import { AUDIT_ATTENTION_TITLE, COPY_PATH_LABEL } from "@/lib/copy";
 import {
@@ -20,6 +21,7 @@ import {
   REPLACE_FILES_CONFIRM_LABEL,
   REPLACE_FILES_LABEL,
 } from "@/lib/copy-in-the-way";
+import { summarizePaths } from "@/lib/drift-merge";
 import { PROBLEMS_EMPTY, PROBLEMS_NOTES_TITLE } from "@/lib/error-copy";
 import { READ_LANDED, readFailed } from "@/lib/read-state";
 import { useAuditStore } from "@/stores/audit";
@@ -289,6 +291,55 @@ describe("a declared item whose place already holds files", () => {
     expect(said).not.toContain("3 places");
   });
 
+  // The path line is cut short on screen, so its tooltip is where the whole
+  // of it is read, for as long as the pointer moves along it.
+  it("keeps every position readable while the pointer moves along the path", async () => {
+    const places = [
+      "/work/acme/.claude/skills/deploy",
+      "/work/acme/.agents/skills/deploy",
+      "/work/acme/.codex/skills/deploy",
+    ];
+    stage([
+      view({
+        drift: [
+          inTheWay("deploy", "claude", {
+            detail: places[0],
+            alsoInTheWay: places.slice(1),
+          }),
+        ],
+        exits: [exit("skill:deploy:claude")],
+      }),
+    ]);
+    const host = mount(
+      <TooltipProvider>
+        <ProblemsPage />
+      </TooltipProvider>,
+    );
+    await settle();
+
+    const shown = summarizePaths(places)?.text;
+    const path = [...host.querySelectorAll("span")].find(
+      (span) => span.firstChild?.textContent === shown,
+    );
+    if (!path) throw new Error("no path line rendered");
+    for (const [type, clientX] of [
+      ["mouseenter", 10],
+      ["mousemove", 40],
+      ["mousemove", 120],
+      ["mousemove", 200],
+    ] as const) {
+      act(() => {
+        path.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX }));
+      });
+    }
+    expect(
+      document.querySelector('[data-slot="tooltip-content"]')?.textContent,
+    ).toBe(places.join("\n"));
+    expect(path.querySelector(".sr-only")?.textContent).toBe(places.join("\n"));
+    act(() => path.focus());
+    expect(document.activeElement).toBe(path);
+  });
+
   // A blocking row core reported no files for carries prose written for a
   // reader, not a path. Joined to a real path it reads as a second file
   // location, and moving files settles nothing it names.
@@ -315,11 +366,9 @@ describe("a declared item whose place already holds files", () => {
     const host = mount(<ProblemsPage />);
     await settle();
 
-    // The row's own path line, the only one carrying every position in
-    // its title.
-    const path = host.querySelector("span[title]");
+    // The row's own path line, the only one carrying every position.
+    const path = host.querySelector('[data-slot="tooltip-trigger"] .sr-only');
     expect(path?.textContent).toBe("/work/acme/.claude/skills/deploy");
-    expect(path?.getAttribute("title")).not.toContain("cannot be compared");
     expect(host.textContent).toContain(why);
     expect(host.textContent).not.toContain(MOVE_FILES_YOURSELF);
   });
