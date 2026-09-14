@@ -2,6 +2,11 @@
 
 ## Consumer-impacting changes
 
+### Unreleased
+
+- The bridge publishes the Anthropic login its child query authenticated as, on `Symbol.for("kendex.pi.claude-bridge.billing-identity.v1")`. The surface is `{ version: 1, currentLoginEmail(sessionId): string | undefined }` and answers for the requested Pi session only. It returns an email when the latest child attempt in that session reports the first-party backend with no API key in use. An API key, a Bedrock, Vertex, Foundry, Anthropic-AWS, Mantle or gateway backend, a child that has not started, a failed probe, and a request stopped by the logged-out credential check all answer `undefined`. Concurrent session lanes cannot overwrite each other, and an older probe cannot overwrite a newer result in the same lane. Session shutdown clears only that session's lane. The process publisher remains available to surviving sessions and a reloaded primary replaces it over the shared lane state.
+- `accountInfo()` is now probed for every child query rather than only a routed one. Nothing waits for it, so it stays off the turn's critical path; a routed query still reuses the same call for its router telemetry.
+
 ### 4.0.1
 
 - Require Claude Agent SDK 0.3.261 or later; the tested SDK bundles Claude Code 2.1.261. A configured or PATH-selected Claude executable still takes precedence and must be 2.1.255 or later for Fable 5.1.

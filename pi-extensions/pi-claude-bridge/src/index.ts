@@ -59,6 +59,7 @@ import {
 	type ClaudeAccountRoute,
 } from "./account-router.js";
 import { BRIDGE_ACCOUNT_HOST } from "./account-host.js";
+import { BRIDGE_BILLING_IDENTITY, CLAUDE_BILLING_IDENTITY_SYMBOL, beginBillingIdentityAttempt, deleteBillingIdentityLane } from "./billing-identity.js";
 import { registerBridgeCommands } from "./bridge-commands.js";
 import { consumeQuery, emitRateLimitEvent, type ClaudeAttemptFailure } from "./consume-query.js";
 import { buildClaudeQueryOptions } from "./query-options.js";
@@ -447,6 +448,10 @@ function releaseProviderTokens(event: string): void {
 	if (g[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] === BRIDGE_ACCOUNT_HOST) {
 		g[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = undefined;
 	}
+	// Billing identity is request-lane state. The shutdown handler removes its
+	// one lane after this call. The process publisher remains available to
+	// sibling sessions and reads the shared lane registry across reloads until a
+	// new primary replaces it.
 	if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
 		debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
 		g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
@@ -549,6 +554,7 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 		if (!ephemeralLane) return;
 		deleteSharedSessionLane(laneId);
 		deleteQueryLane(laneId);
+		deleteBillingIdentityLane(laneId);
 	};
 
 	// DEBUG: trace followUp message triggering
@@ -715,6 +721,7 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 	}
 
 	// --- Fresh query ---
+	const recordBillingIdentity = beginBillingIdentityAttempt();
 
 	// Fail-fast credential re-check (only for a fresh query — NEVER for
 	// tool-result delivery of an in-flight query, handled above, where creds were
@@ -1153,7 +1160,7 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 	// query CAN end in that window (abort, child process death throwing out of
 	// the generator). Live-ctx handlers there mutated the subagent's turn state
 	// and stream and skipped the parent's own teardown entirely.
-	consumeQuery(sdkQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, attemptFailure)
+	consumeQuery(sdkQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, recordBillingIdentity, account, router, attemptFailure)
 		.then(async ({ capturedSessionId, failure }) => {
 			debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
 			if (streamIdleTimedOut) {
@@ -1241,7 +1248,7 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 					debug(`provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${steerPreview}`);
 
 					try {
-						const continuation = await consumeQuery(contQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);
+						const continuation = await consumeQuery(contQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, recordBillingIdentity, account, router);
 						if (continuation.failure) {
 							// Continuations never rotate: the original prompt already
 							// committed on this account.
@@ -1397,6 +1404,10 @@ export default function (pi: ExtensionAPI) {
 	if (claimPrimaryInstance()) {
 		const host = globalThis as Record<symbol, any>;
 		host[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = BRIDGE_ACCOUNT_HOST;
+		// Published beside it so a reader finds a store that answers "no login
+		// confirmed yet" rather than nothing at all, and so both are owned by
+		// the same instance.
+		host[CLAUDE_BILLING_IDENTITY_SYMBOL] = BRIDGE_BILLING_IDENTITY;
 	}
 
 	// Reset shared (Claude) conversation state on pi session lifecycle events.
@@ -1434,6 +1445,7 @@ export default function (pi: ExtensionAPI) {
 		});
 		deleteSharedSessionLane(sessionId);
 		deleteQueryLane(sessionId);
+		deleteBillingIdentityLane(sessionId);
 	});
 	pi.on("message_end", (event, ctx) => runInRequestLane(ctx.sessionManager.getSessionId(), () => {
 		const message = (event as { message?: AssistantMessage }).message;

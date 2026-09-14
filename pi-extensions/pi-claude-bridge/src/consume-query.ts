@@ -3,7 +3,7 @@
 // generator and pushes events into the query's captured Pi stream.
 
 import { type Model } from "@earendil-works/pi-ai";
-import { type query } from "@anthropic-ai/claude-agent-sdk";
+import { type AccountInfo, type query } from "@anthropic-ai/claude-agent-sdk";
 import {
 	classifyClaudeFailure,
 	rateLimitResetFromInfo,
@@ -88,6 +88,7 @@ export async function consumeQuery(
 	model: Model<any>,
 	bridgeConfig: Config,
 	wasAborted: () => boolean,
+	recordBillingIdentity: (info: AccountInfo) => void,
 	account?: ClaudeAccountRoute,
 	router?: ClaudeAccountRouterV1,
 	// Mirror of the held failure for the caller's .catch: the SDK iterator can
@@ -100,6 +101,7 @@ export async function consumeQuery(
 	let capturedSessionId: string | undefined;
 	let failure: ClaudeAttemptFailure | undefined;
 	let accountProbe: Promise<void> | undefined;
+	let accountInfoProbe: Promise<AccountInfo> | undefined;
 	const holdFailure = (next: ClaudeAttemptFailure | undefined): void => {
 		failure = next;
 		if (attemptFailureBox) attemptFailureBox.failure = next;
@@ -216,9 +218,22 @@ export async function consumeQuery(
 					// from the teardown flush, which runs outside this function's scope.
 					queryCtx.childSessionId = capturedSessionId;
 					noteFastModeDisabledReason(message, bridgeConfig);
+					// Which login this child authenticated as is published for other
+					// extensions, for every child rather than only a routed one:
+					// an unrouted child is the common case and its identity is
+					// just as unknowable from outside the SDK. Nothing waits for
+					// it, so it stays off the turn's critical path. The call sits
+					// in an async IIFE so a synchronous throw arrives as a
+					// rejection the debug line below names.
+					if (!accountInfoProbe) {
+						accountInfoProbe = (async () => sdkQuery.accountInfo())();
+						void accountInfoProbe
+							.then((info) => recordBillingIdentity(info))
+							.catch((error) => debug("consumeQuery: billing identity probe rejected:", error));
+					}
 					if (account && router && !accountProbe) {
 						accountProbe = Promise.allSettled([
-							sdkQuery.accountInfo().then((info) => router.recordIdentity(account.profileId, {
+							accountInfoProbe.then((info) => router.recordIdentity(account.profileId, {
 								email: info.email,
 								organization: info.organization,
 								subscriptionType: info.subscriptionType,

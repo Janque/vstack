@@ -54470,6 +54470,52 @@ var BRIDGE_ACCOUNT_HOST = {
   probeProfile: probeClaudeAccountProfile
 };
 
+// src/billing-identity.ts
+var CLAUDE_BILLING_IDENTITY_SYMBOL = /* @__PURE__ */ Symbol.for("kendex.pi.claude-bridge.billing-identity.v1");
+var FIRST_PARTY = "firstParty";
+var BILLING_IDENTITY_LANES_SYMBOL = /* @__PURE__ */ Symbol.for("kendex.pi.claude-bridge.billing-identity-lanes.v1");
+function sharedBillingIdentityLanes() {
+  const host = globalThis;
+  let lanes = host[BILLING_IDENTITY_LANES_SYMBOL];
+  if (!lanes) {
+    lanes = /* @__PURE__ */ new Map();
+    host[BILLING_IDENTITY_LANES_SYMBOL] = lanes;
+  }
+  return lanes;
+}
+function nonEmpty(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
+}
+function loginEmailFrom(info) {
+  if (info.apiProvider !== FIRST_PARTY) return void 0;
+  if (nonEmpty(info.apiKeySource)) return void 0;
+  return nonEmpty(info.email);
+}
+function makeBillingIdentityStore(lanes = /* @__PURE__ */ new Map()) {
+  return {
+    version: 1,
+    currentLoginEmail: (sessionId) => lanes.get(sessionId)?.loginEmail,
+    beginAttempt: (sessionId) => {
+      const attempt = /* @__PURE__ */ Symbol("billing-identity-attempt");
+      lanes.set(sessionId, { attempt });
+      return (info) => {
+        const current = lanes.get(sessionId);
+        if (current?.attempt !== attempt) return;
+        lanes.set(sessionId, { attempt, loginEmail: loginEmailFrom(info) });
+      };
+    },
+    deleteLane: (sessionId) => lanes.delete(sessionId),
+    clear: () => lanes.clear()
+  };
+}
+var BRIDGE_BILLING_IDENTITY = makeBillingIdentityStore(sharedBillingIdentityLanes());
+function beginBillingIdentityAttempt() {
+  return BRIDGE_BILLING_IDENTITY.beginAttempt(currentRequestLaneId());
+}
+function deleteBillingIdentityLane(sessionId) {
+  BRIDGE_BILLING_IDENTITY.deleteLane(sessionId);
+}
+
 // src/bridge-commands.ts
 var COMMANDS_REGISTERED_KEY = /* @__PURE__ */ Symbol.for("claude-bridge:commandsRegistered");
 function commandCwd(ctx2) {
@@ -54559,10 +54605,11 @@ function noteFastModeDisabledReason(message, bridgeConfig) {
   const text = FAST_MODE_DISABLED_REASON_TEXT[reason] ?? `unavailable (${reason})`;
   safeNotify(`Pi Claude: fast mode is enabled in settings but Claude Code declined it \u2014 ${text}.`, "warning");
 }
-async function consumeQuery(sdkQuery, queryCtx, customToolNameToPi, model, bridgeConfig, wasAborted, account, router, attemptFailureBox) {
+async function consumeQuery(sdkQuery, queryCtx, customToolNameToPi, model, bridgeConfig, wasAborted, recordBillingIdentity, account, router, attemptFailureBox) {
   let capturedSessionId;
   let failure;
   let accountProbe;
+  let accountInfoProbe;
   const holdFailure = (next) => {
     failure = next;
     if (attemptFailureBox) attemptFailureBox.failure = next;
@@ -54640,9 +54687,13 @@ async function consumeQuery(sdkQuery, queryCtx, customToolNameToPi, model, bridg
           capturedSessionId = message.session_id;
           queryCtx.childSessionId = capturedSessionId;
           noteFastModeDisabledReason(message, bridgeConfig);
+          if (!accountInfoProbe) {
+            accountInfoProbe = (async () => sdkQuery.accountInfo())();
+            void accountInfoProbe.then((info) => recordBillingIdentity(info)).catch((error51) => debug("consumeQuery: billing identity probe rejected:", error51));
+          }
           if (account && router && !accountProbe) {
             accountProbe = Promise.allSettled([
-              sdkQuery.accountInfo().then((info) => router.recordIdentity(account.profileId, {
+              accountInfoProbe.then((info) => router.recordIdentity(account.profileId, {
                 email: info.email,
                 organization: info.organization,
                 subscriptionType: info.subscriptionType
@@ -55240,6 +55291,7 @@ function streamClaudeAgentSdkInLane(model, context, options) {
     if (!ephemeralLane) return;
     deleteSharedSessionLane(laneId);
     deleteQueryLane(laneId);
+    deleteBillingIdentityLane(laneId);
   };
   const lastMsgRole = context.messages[context.messages.length - 1]?.role;
   const cwd = options?.cwd ?? process.cwd();
@@ -55340,6 +55392,7 @@ function streamClaudeAgentSdkInLane(model, context, options) {
     });
     return stream;
   }
+  const recordBillingIdentity = beginBillingIdentityAttempt();
   if (!hasClaudeCredentials() && !resolveClaudeAccountRouter()) {
     try {
       applyProviderRegistration("pre-spawn");
@@ -55665,7 +55718,7 @@ function streamClaudeAgentSdkInLane(model, context, options) {
     abortCtx.currentPiStream?.end();
     abortCtx.currentPiStream = null;
   };
-  consumeQuery(sdkQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router, attemptFailure).then(async ({ capturedSessionId, failure }) => {
+  consumeQuery(sdkQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, recordBillingIdentity, account, router, attemptFailure).then(async ({ capturedSessionId, failure }) => {
     debug(`provider: consumeQuery completed, stopReason=${abortCtx.turnOutput?.stopReason}, failure=${failure?.kind ?? "none"}, aborted=${wasAborted}`);
     if (streamIdleTimedOut) {
       dropDeferredUserMessages("stream-idle-timeout-completion");
@@ -55718,7 +55771,7 @@ function streamClaudeAgentSdkInLane(model, context, options) {
         abortCtx.activeQuery = contQuery;
         debug(`provider: continuation query, model=${queryModel.id}, resume=${resumeId.slice(0, 8)}, account=${account?.label ?? "legacy"}, prompt=${steerPreview}`);
         try {
-          const continuation = await consumeQuery(contQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, account, router);
+          const continuation = await consumeQuery(contQuery, abortCtx, customToolNameToPi, queryModel, bridgeConfig, () => wasAborted, recordBillingIdentity, account, router);
           if (continuation.failure) {
             recordAttemptFailure(continuation.failure);
             if (!abortCtx.handledTerminalError) surfaceFailure(continuation.failure);
@@ -55823,6 +55876,7 @@ function index_default(pi2) {
   if (claimPrimaryInstance()) {
     const host = globalThis;
     host[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = BRIDGE_ACCOUNT_HOST;
+    host[CLAUDE_BILLING_IDENTITY_SYMBOL] = BRIDGE_BILLING_IDENTITY;
   }
   const clearSession = (event) => {
     const activeSession = getSharedSession();
@@ -55848,6 +55902,7 @@ function index_default(pi2) {
     });
     deleteSharedSessionLane(sessionId);
     deleteQueryLane(sessionId);
+    deleteBillingIdentityLane(sessionId);
   });
   pi2.on("message_end", (event, ctx2) => runInRequestLane(ctx2.sessionManager.getSessionId(), () => {
     const message = event.message;
